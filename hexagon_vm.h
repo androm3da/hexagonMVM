@@ -18,6 +18,7 @@
 #define vmnewmap  trap1(#11)
 #define vmcache   trap1(#13)
 #define vmgettime trap1(#14)
+#define vmtimerop trap1(#14)
 #define vmsettime trap1(#15)
 #define vmwait    trap1(#16)
 #define vmyield   trap1(#17)
