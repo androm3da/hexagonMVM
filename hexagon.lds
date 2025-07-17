@@ -40,7 +40,7 @@ ENTRY (start)
 PA_START = 0x00000000;
 SECTIONS
 {
-  . = 0xffff0000;
+  . = 0xfff00000;
   vm_bootup = 0xd0000000;
   .vm_data : AT (vm_bootup + PA_START)
   {
