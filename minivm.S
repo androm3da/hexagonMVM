@@ -1109,8 +1109,35 @@ MINIVM_handle_int:
 	crswap(r24,sgp)
 	memd(r24+#CONTEXT_r1514) = r15:14
 	memd(r24+#CONTEXT_r1312) = r13:12
+	memd(r24+#CONTEXT_r1110) = r11:10
+
+	// Check if this is a timer interrupt by reading L2VIC VID_0 register
+	// Timer interrupt comes through L2VIC group 0 (IRQ2, VID 0)
+	r10 = memw(##MINIVM_l2vic_base_addr)
+	r11 = add(r10, #0x10)  // L2VIC_VID_0 offset
+	r10 = memw(r11)  // Read VID_0 to get interrupt source
+
+	// Check if it's the timer interrupt
+	p0 = cmp.eq(r10, #TIMER_INT_NUM)
+	if (!p0) jump not_timer_int
+
+	// It's a timer interrupt - reprogram the timer for the next period
+	// Use TVAL method like working reference implementations
+	r10 = memw(##MINIVM_qtimer_base_addr)
+	r11 = #(DEFAULT_CLK_FREQ_HZ / 100)  // 100Hz timer value
+	r12 = add(r10, #0x28)  // CNTP_TVAL offset (frame 0)
+	memw(r12) = r11  // Set timer for next period
+
+	// Re-enable the interrupt in L2VIC
+	r10 = memw(##MINIVM_l2vic_base_addr)
+	r11 = add(r10, #0x200)  // L2VIC_INT_ENABLE_SET offset
+	r12 = #1
+	r12 = asl(r12, #TIMER_INT_NUM)  // Bit for timer interrupt
+	memw(r11) = r12
+
+not_timer_int:
+	// Continue with normal interrupt handling
 	{
-		memd(r24+#CONTEXT_r1110) = r11:10
 		r15 = p3:0
 		r14 = #EVENT_NUMBER_INTERRUPT*4
 		jump MINIVM_common_user_push
@@ -1364,28 +1391,95 @@ vm_bootup_code:
 
 	memw(##MINIVM_ss_base_addr) = r1
 
+	// Setup L2VIC first
+	r0 = add(r1, #L2VIC_OFF_BYTES)
+	memw(##MINIVM_l2vic_base_addr) = r0
+
 	// Setup timer
 	r1 = add(r1, #TIMER_OFF_BYTES)
 	memw(##MINIVM_qtimer_base_addr) = r1
 
-    // TODO: Temporary TLB entry for the timer:
+    // Create TLB entry for timer MMIO access
+	// r1 contains the timer physical base address
+	// Create lower word (r4): Physical page + permissions + cache + page size
+	r4 = lsr(r1, #TARGET_PAGE_BITS)        // Physical page number
+	r4 = asl(r4, #1)                       // Make room for page size bits
+	r4 = or(r4, #TLB_PGSIZE_64K)           // 64KB page size for MMIO
+	r15 = #TLB_C_DEV                       // Device memory (uncached)
+	r4 = insert(r15, #TLB_CCCC_WIDTH, #TLB_CCCC_OFF)
+	r15 = #0x6                             // X:0 W:1 R:1 U:0 (supervisor RW, non-executable)
+	r4 = insert(r15, #TLB_XWRU_WIDTH, #TLB_XWRU_OFF)
+
+	// Create upper word (r5): Virtual page + ASID + flags
+	r5 = lsr(r1, #TARGET_PAGE_BITS)        // Use identity mapping (VA = PA)
+	// ASID = 0 (kernel), AA = 0, XPB = 0
+	r15 = #3                               // V:1 G:1 (valid, global)
+	r5 = insert(r15, #TLB_VG_WIDTH, #TLB_VG_OFF)
+
+	// Write TLB entry for timer access
 	r15 = #99
 	tlbw(r5:4, r15)
 
-    // TODO: Defer this init to a different context?
-	r2 = add(r1, #TIMER_REG_CNTSR)
-//	memw(r2) = #~0
+	// Create TLB entry for L2VIC MMIO access
+	r0 = memw(##MINIVM_l2vic_base_addr)
+	// Create lower word (r4): Physical page + permissions + cache + page size
+	r4 = lsr(r0, #TARGET_PAGE_BITS)        // Physical page number
+	r4 = asl(r4, #1)                       // Make room for page size bits
+	r4 = or(r4, #TLB_PGSIZE_64K)           // 64KB page size for MMIO
+	r15 = #TLB_C_DEV                       // Device memory (uncached)
+	r4 = insert(r15, #TLB_CCCC_WIDTH, #TLB_CCCC_OFF)
+	r15 = #0x6                             // X:0 W:1 R:1 U:0 (supervisor RW, non-executable)
+	r4 = insert(r15, #TLB_XWRU_WIDTH, #TLB_XWRU_OFF)
 
+	// Create upper word (r5): Virtual page + ASID + flags
+	r5 = lsr(r0, #TARGET_PAGE_BITS)        // Use identity mapping (VA = PA)
+	// ASID = 0 (kernel), AA = 0, XPB = 0
+	r15 = #3                               // V:1 G:1 (valid, global)
+	r5 = insert(r15, #TLB_VG_WIDTH, #TLB_VG_OFF)
+
+	// Write TLB entry for L2VIC access
+	r15 = #98
+	tlbw(r5:4, r15)
+
+    // Initialize timer for 100Hz interrupts
+	// Set access control to enable all frame access (reference uses 0x3f)
 	r2 = add(r1, #TIMER_REG_CNTACR)
-//	memw(r2) = #~0
+	r3 = #0x3f  // Enable all access permissions like reference
+	memw(r2) = r3
 
-	r2 = add(r1, #TIMER_REG_CNTFRQ)
-//	memw(r2) = #DEFAULT_CLK_FREQ_HZ
+	// Calculate 100Hz timer value (19.2MHz / 100 = 192000 cycles)
+	r3 = #(DEFAULT_CLK_FREQ_HZ / 100)
 
-	r2 = add(r1, #TIMER_REG_ENABLE)
-//	memw(r2) = #1
+	// Set timer value for 100Hz periodic interrupts using TVAL (like reference)
+	// Use frame 0 (no offset) for timer interrupt
+	r2 = add(r1, #0x28)  // CNTP_TVAL offset
+	memw(r2) = r3
 
-	// TODO: Enable the timer interrupt:
+	// Enable timer (ENABLE bit only, like reference)
+	r2 = add(r1, #0x2c)  // CNTP_CTL offset
+	r3 = #1  // Enable bit (1) only, like reference implementation
+	memw(r2) = r3
+
+	// Configure timer interrupt in L2VIC following reference pattern
+	r0 = memw(##MINIVM_l2vic_base_addr)
+
+	// Create bit mask for timer interrupt
+	r15 = #1
+	r15 = asl(r15, #TIMER_INT_NUM)  // Create bit mask for timer interrupt
+
+	// First clear interrupt enable (like reference)
+	r2 = add(r0, #0x180)  // L2VIC_INT_ENABLE_CLEAR offset
+	memw(r2) = r15
+
+	// Set interrupt type to level (0) like reference
+	r2 = add(r0, #0x280)  // L2VIC_INT_TYPE offset
+	r3 = memw(r2)
+	r3 = clrbit(r3, #TIMER_INT_NUM)  // Clear timer interrupt bit for level interrupt
+	memw(r2) = r3
+
+	// Now enable the interrupt (like reference)
+	r2 = add(r0, #0x200)  // L2VIC_INT_ENABLE_SET offset
+	memw(r2) = r15
 
 	// Set return point to guest entry
 	r31 = ##GUEST_ENTRY
@@ -1484,5 +1578,8 @@ MINIVM_ss_base_addr:
 	.word 0
 
 MINIVM_qtimer_base_addr:
+	.word 0
+
+MINIVM_l2vic_base_addr:
 	.word 0
 
