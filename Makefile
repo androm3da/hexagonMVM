@@ -16,7 +16,7 @@ export CARGO_TARGET_HEXAGON_UNKNOWN_NONE_ELF_LINKER := $(CC)
 endif
 
 GUEST_TESTS := first test_vmversion test_interrupts test_processors test_mmu \
-	test_hvm_vmfuncs
+	test_hvm_vmfuncs test_hvm_badtrap
 
 .PHONY: guest-tests minivm minivm-with-tests on-target-tests zephyr-boot clean-guest-tests
 
