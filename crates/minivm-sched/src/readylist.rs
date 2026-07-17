@@ -5,33 +5,52 @@
 
 //! Priority-based ready queue.
 //!
-//! The ready list is a priority queue backed by:
-//! - A validity bitmap (`[u32; 8]` for 256 priorities) for fast "best priority" lookup
-//! - Per-priority intrusive circular doubly-linked list (ring) heads
+//! The ready list is a priority queue backed by a `BinaryHeap` keyed on
+//! `(priority, sequence)`, with `sequence` breaking ties in FIFO order
+//! (lower sequence = scheduled first). `append` assigns an increasing
+//! sequence number; `insert` (front-of-queue) assigns a decreasing one, so
+//! it always sorts ahead of any already-appended entry at the same
+//! priority.
 //!
-//! Ring operations work on `ThreadContext` arrays using indices rather than raw
-//! pointers, making them safe and testable on the host.
+//! Removal by thread identity (`remove`) — needed when a thread blocks or
+//! is killed out of order, not just when the best-priority thread is
+//! popped — has no O(1) equivalent on a `BinaryHeap`. Since this is the
+//! hottest operation here (called on every context switch from the
+//! scheduler), it uses lazy deletion: a `removed` side bitmap is stamped
+//! O(1), and stale (removed) entries are discarded lazily as they are
+//! popped off the heap in `getbest`.
 //!
 //! Index 0 is reserved as "null" (no thread). Valid thread indices start at 1.
 
 use crate::context::ThreadContext;
-use minivm_types::consts::{MAX_PRIO, MAX_PRIOS};
+use alloc::collections::BinaryHeap;
+use core::cmp::Reverse;
+use minivm_types::consts::MAX_PRIOS;
 use minivm_types::vm::ThreadStatus;
 
 /// Sentinel index meaning "no thread" (equivalent to NULL pointer).
 pub const IDX_NONE: u32 = 0;
 
-/// Number of u32 words in the validity bitmap.
-const VALIDS_WORDS: usize = MAX_PRIOS as usize / 32;
+/// Number of u32 words in the removed-thread bitmap.
+const REMOVED_WORDS: usize = 256 / 32;
+
+/// Heap entry: `(priority, sequence, thread index)`. Ordered so that the
+/// numerically lowest priority (highest scheduling priority) sorts first,
+/// with ties broken by sequence (lowest first, i.e. FIFO for `append`).
+type Entry = Reverse<(u8, i64, u32)>;
 
 /// Ready list: priority-based queue of threads.
 pub struct ReadyList {
-    /// Validity bitmap: bit N set means priority N has at least one ready thread.
-    /// Uses u32 words for reliable codegen on 32-bit targets (Hexagon).
-    valids: [u32; VALIDS_WORDS],
-    /// Per-priority ring head index (into a ThreadContext array).
-    /// `IDX_NONE` means empty.
-    heads: [u32; MAX_PRIOS as usize],
+    /// Min-heap of ready threads, keyed by (priority, sequence).
+    heap: BinaryHeap<Entry>,
+    /// Monotonically increasing counter for FIFO ordering on `append`.
+    next_seq: i64,
+    /// Monotonically decreasing counter so `insert` always sorts ahead of
+    /// same-priority entries already in the heap.
+    prev_seq: i64,
+    /// Lazy-deletion bitmap: bit N set means thread index N was removed
+    /// and its heap entry (if still present) must be discarded on pop.
+    removed: [u32; REMOVED_WORDS],
 }
 
 impl Default for ReadyList {
@@ -42,168 +61,108 @@ impl Default for ReadyList {
 
 impl ReadyList {
     /// Create an empty ready list.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            valids: [0u32; VALIDS_WORDS],
-            heads: [IDX_NONE; MAX_PRIOS as usize],
+            heap: BinaryHeap::new(),
+            next_seq: 0,
+            prev_seq: -1,
+            removed: [0u32; REMOVED_WORDS],
+        }
+    }
+
+    fn is_removed(&self, idx: u32) -> bool {
+        let word = (idx >> 5) as usize;
+        let bit = idx & 0x1f;
+        (self.removed[word] >> bit) & 1 != 0
+    }
+
+    fn set_removed(&mut self, idx: u32, removed: bool) {
+        let word = (idx >> 5) as usize;
+        let bit = idx & 0x1f;
+        if removed {
+            self.removed[word] |= 1u32 << bit;
+        } else {
+            self.removed[word] &= !(1u32 << bit);
+        }
+    }
+
+    /// Discard stale (removed) entries from the top of the heap.
+    fn drain_removed(&mut self) {
+        while let Some(&Reverse((_, _, idx))) = self.heap.peek() {
+            if self.is_removed(idx) {
+                self.heap.pop();
+                self.set_removed(idx, false);
+            } else {
+                break;
+            }
         }
     }
 
     /// Find the highest (numerically lowest) priority that has a ready thread.
     ///
     /// Returns `MAX_PRIOS` if no threads are ready.
-    ///
-    /// Uses trailing-zero count to scan the bitmap efficiently.
-    pub fn best_prio(&self) -> u32 {
-        let mut prio: u32 = 0;
-        for i in 0..VALIDS_WORDS {
-            let ct0 = self.valids[i].trailing_zeros();
-            prio += ct0;
-            if ct0 < 32 {
-                return prio;
-            }
+    pub fn best_prio(&mut self) -> u32 {
+        self.drain_removed();
+        match self.heap.peek() {
+            Some(&Reverse((prio, _, _))) => prio as u32,
+            None => MAX_PRIOS,
         }
-        prio
     }
 
     /// Check whether any threads are ready.
-    pub fn any_valid(&self) -> bool {
+    pub fn any_valid(&mut self) -> bool {
         self.best_prio() < MAX_PRIOS
     }
 
     /// Check whether a thread at a given priority is ready.
-    pub fn prio_valid(&self, prio: u32) -> bool {
-        if prio > MAX_PRIO {
-            return false;
-        }
-        let word = (prio >> 5) as usize;
-        let bit = prio & 0x1f;
-        (self.valids[word] >> bit) & 1 != 0
-    }
-
-    /// Set a priority as valid in the bitmap.
-    fn set_prio(&mut self, prio: u32) {
-        let word = (prio >> 5) as usize;
-        let bit = prio & 0x1f;
-        self.valids[word] |= 1u32 << bit;
-    }
-
-    /// Clear a priority from the bitmap.
-    fn clear_prio(&mut self, prio: u32) {
-        let word = (prio >> 5) as usize;
-        let bit = prio & 0x1f;
-        // Use volatile write to prevent Hexagon optimizer from eliding the store.
-        let val = self.valids[word] & !(1u32 << bit);
-        unsafe {
-            core::ptr::write_volatile(&mut self.valids[word], val);
-        }
+    pub fn prio_valid(&mut self, prio: u32) -> bool {
+        self.drain_removed();
+        self.heap
+            .iter()
+            .any(|&Reverse((p, _, idx))| p as u32 == prio && !self.is_removed(idx))
     }
 
     /// Append a thread to the end of its priority ring (last to be scheduled).
     ///
     /// Sets the thread's status to Ready.
     pub fn append(&mut self, threads: &mut [ThreadContext], idx: u32) {
-        let prio = threads[idx as usize].prio as u32;
+        let prio = threads[idx as usize].prio;
         threads[idx as usize].status = ThreadStatus::Ready as u8;
-        ring_append(&mut self.heads[prio as usize], threads, idx);
-        self.set_prio(prio);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.set_removed(idx, false);
+        self.heap.push(Reverse((prio, seq, idx)));
     }
 
     /// Insert a thread at the front of its priority ring (first to be scheduled).
     ///
     /// Sets the thread's status to Ready.
     pub fn insert(&mut self, threads: &mut [ThreadContext], idx: u32) {
-        let prio = threads[idx as usize].prio as u32;
+        let prio = threads[idx as usize].prio;
         threads[idx as usize].status = ThreadStatus::Ready as u8;
-        ring_insert(&mut self.heads[prio as usize], threads, idx);
-        self.set_prio(prio);
+        let seq = self.prev_seq;
+        self.prev_seq -= 1;
+        self.set_removed(idx, false);
+        self.heap.push(Reverse((prio, seq, idx)));
     }
 
     /// Remove a specific thread from the ready list.
     ///
     /// The caller guarantees that the thread is actually in the ready list.
-    // inline(never) works around a Hexagon LLVM codegen bug where the
-    // optimizer eliminates the bitmap clear in release builds.
-    #[inline(never)]
-    pub fn remove(&mut self, threads: &mut [ThreadContext], idx: u32) {
-        let prio = threads[idx as usize].prio as u32;
-        ring_remove(&mut self.heads[prio as usize], threads, idx);
-        // Unconditionally clear the bitmap bit, then re-set if ring
-        // is not empty. This avoids a conditional-clear pattern that
-        // Hexagon LLVM miscompiles in release builds.
-        self.clear_prio(prio);
-        if self.heads[prio as usize] != IDX_NONE {
-            self.set_prio(prio);
-        }
+    /// O(1): marks the thread as removed; its stale heap entry is
+    /// discarded lazily on the next pop that reaches it.
+    pub fn remove(&mut self, _threads: &mut [ThreadContext], idx: u32) {
+        self.set_removed(idx, true);
     }
 
     /// Remove and return the best (highest-priority) ready thread.
     ///
     /// Returns `IDX_NONE` if no threads are ready.
-    pub fn getbest(&mut self, threads: &mut [ThreadContext]) -> u32 {
-        let prio = self.best_prio();
-        if prio >= MAX_PRIOS {
-            return IDX_NONE;
-        }
-        let head = self.heads[prio as usize];
-        if head != IDX_NONE {
-            self.remove(threads, head);
-        }
-        head
-    }
-}
-
-// --- Ring buffer operations (index-based) ---
-//
-// These operate on circular doubly-linked lists using the `next`/`prev`
-// fields of ThreadContext as indices into the thread array.
-
-/// Append a node to the end of the ring (before the head).
-fn ring_append(head: &mut u32, threads: &mut [ThreadContext], idx: u32) {
-    if *head == IDX_NONE {
-        // Empty ring: node points to itself
-        threads[idx as usize].next = idx;
-        threads[idx as usize].prev = idx;
-        *head = idx;
-    } else {
-        // Insert before head (at the end of the ring)
-        let head_idx = *head;
-        let tail = threads[head_idx as usize].prev;
-        threads[idx as usize].next = head_idx;
-        threads[idx as usize].prev = tail;
-        threads[tail as usize].next = idx;
-        threads[head_idx as usize].prev = idx;
-    }
-}
-
-/// Insert a node at the front of the ring (becomes the new head).
-fn ring_insert(head: &mut u32, threads: &mut [ThreadContext], idx: u32) {
-    if *head == IDX_NONE {
-        threads[idx as usize].next = idx;
-        threads[idx as usize].prev = idx;
-    } else {
-        let head_idx = *head;
-        let tail = threads[head_idx as usize].prev;
-        threads[idx as usize].next = head_idx;
-        threads[idx as usize].prev = tail;
-        threads[tail as usize].next = idx;
-        threads[head_idx as usize].prev = idx;
-    }
-    *head = idx;
-}
-
-/// Remove a node from the ring.
-fn ring_remove(head: &mut u32, threads: &mut [ThreadContext], idx: u32) {
-    let prev = threads[idx as usize].prev;
-    let next = threads[idx as usize].next;
-    threads[prev as usize].next = next;
-    threads[next as usize].prev = prev;
-
-    if *head == idx {
-        *head = next;
-        if *head == idx {
-            // Was the only element
-            *head = IDX_NONE;
+    pub fn getbest(&mut self, _threads: &mut [ThreadContext]) -> u32 {
+        self.drain_removed();
+        match self.heap.pop() {
+            Some(Reverse((_, _, idx))) => idx,
+            None => IDX_NONE,
         }
     }
 }
@@ -224,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_readylist_empty() {
-        let rl = ReadyList::new();
+        let mut rl = ReadyList::new();
         assert!(!rl.any_valid());
         assert_eq!(rl.best_prio(), MAX_PRIOS);
     }
@@ -387,47 +346,5 @@ mod tests {
         assert_eq!(rl.getbest(&mut threads), 1);
         assert_eq!(rl.best_prio(), 255);
         assert_eq!(rl.getbest(&mut threads), 2);
-    }
-
-    #[test]
-    fn test_ring_append_single() {
-        let mut threads = make_threads(4);
-        let mut head = IDX_NONE;
-
-        ring_append(&mut head, &mut threads, 1);
-        assert_eq!(head, 1);
-        assert_eq!(threads[1].next, 1);
-        assert_eq!(threads[1].prev, 1);
-    }
-
-    #[test]
-    fn test_ring_append_multiple() {
-        let mut threads = make_threads(4);
-        let mut head = IDX_NONE;
-
-        ring_append(&mut head, &mut threads, 1);
-        ring_append(&mut head, &mut threads, 2);
-        ring_append(&mut head, &mut threads, 3);
-
-        // Head is still 1
-        assert_eq!(head, 1);
-        // Ring: 1 -> 2 -> 3 -> 1 (forward)
-        assert_eq!(threads[1].next, 2);
-        assert_eq!(threads[2].next, 3);
-        assert_eq!(threads[3].next, 1);
-        // Ring: 1 -> 3 -> 2 -> 1 (backward)
-        assert_eq!(threads[1].prev, 3);
-        assert_eq!(threads[3].prev, 2);
-        assert_eq!(threads[2].prev, 1);
-    }
-
-    #[test]
-    fn test_ring_remove_only() {
-        let mut threads = make_threads(4);
-        let mut head = IDX_NONE;
-
-        ring_append(&mut head, &mut threads, 1);
-        ring_remove(&mut head, &mut threads, 1);
-        assert_eq!(head, IDX_NONE);
     }
 }
