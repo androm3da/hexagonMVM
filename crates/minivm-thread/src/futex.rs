@@ -5,10 +5,20 @@
 
 //! Futex wait/wake (hash table).
 //!
-//! Futex waiters are stored in a hash table of circular linked lists
-//! (rings). Each ring is sorted by priority (best priority at head).
-//! The hash function uses FNV prime multiplication on the physical
-//! address of the futex.
+//! Futex waiters are stored in a hash table of per-bucket `BinaryHeap`s,
+//! ordered by `(priority, sequence)` so the best-priority waiter (lowest
+//! priority value, earliest sequence) is always at the head. The hash
+//! function uses FNV prime multiplication on the physical address of the
+//! futex.
+//!
+//! `remove_one`/`cancel` need to remove an entry by content (matching
+//! futex address) or by thread identity, not just pop the head — since
+//! `BinaryHeap` has no such operation, and the futex path is not yet wired
+//! to a real syscall (low frequency), these rebuild the bucket via a
+//! priority-order drain-and-filter rather than tracking a side table.
+
+use alloc::collections::BinaryHeap;
+use core::cmp::Reverse;
 
 /// Number of hash bits.
 pub const FUTEX_HASHBITS: u32 = 6;
@@ -16,6 +26,9 @@ pub const FUTEX_HASHBITS: u32 = 6;
 pub const FUTEX_HASHSIZE: usize = 1 << FUTEX_HASHBITS;
 /// FNV hash prime.
 pub const FUTEX_PRIME: u32 = 2654435761;
+
+/// Sentinel for empty ring/no thread.
+pub const IDX_NONE: u32 = 0;
 
 /// Compute the futex hash value for a physical address (shifted by 2).
 ///
@@ -28,17 +41,17 @@ pub fn futex_hash(pa_shifted: u64) -> usize {
     (bits ^ hi) as usize % FUTEX_HASHSIZE
 }
 
-/// A futex hash table with index-based waiter rings.
-///
-/// Each bucket is a ring head (index into a thread context pool).
-/// IDX_NONE (0) means empty bucket.
-pub struct FutexTable {
-    /// Hash buckets. Each is the index of the ring head, or 0 for empty.
-    pub buckets: [u32; FUTEX_HASHSIZE],
-}
+/// Heap entry: `(priority, sequence, thread index)`. Lower priority value
+/// and lower sequence sort first (best priority, then FIFO).
+type Entry = Reverse<(u8, u64, u32)>;
 
-/// Sentinel for empty ring/no thread.
-pub const IDX_NONE: u32 = 0;
+/// A futex hash table with per-bucket priority-ordered waiter heaps.
+pub struct FutexTable {
+    /// Hash buckets, each a min-heap of waiters ordered by (priority, seq).
+    pub buckets: [BinaryHeap<Entry>; FUTEX_HASHSIZE],
+    /// Monotonically increasing counter for FIFO ordering within a priority.
+    next_seq: u64,
+}
 
 impl Default for FutexTable {
     fn default() -> Self {
@@ -47,9 +60,10 @@ impl Default for FutexTable {
 }
 
 impl FutexTable {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            buckets: [IDX_NONE; FUTEX_HASHSIZE],
+            buckets: core::array::from_fn(|_| BinaryHeap::new()),
+            next_seq: 0,
         }
     }
 
@@ -58,129 +72,48 @@ impl FutexTable {
     /// `hash`: the hash bucket index
     /// `idx`: the thread index to add
     /// `prio`: the thread's priority
-    /// `next_fn`/`prev_fn`: accessors for the ring links in the thread pool
-    ///
-    /// For simplicity, inserts at the end (FIFO within same priority).
-    /// The real implementation sorts by priority; this is a simplified version.
-    pub fn add_waiter(
-        &mut self,
-        hash: usize,
-        idx: u32,
-        prio: u8,
-        nexts: &mut [u32],
-        prevs: &mut [u32],
-        prios: &[u8],
-    ) {
-        let head = self.buckets[hash];
-        if head == IDX_NONE {
-            // Empty ring: self-loop
-            nexts[idx as usize] = idx;
-            prevs[idx as usize] = idx;
-            self.buckets[hash] = idx;
-            return;
-        }
-
-        // Insert at position maintaining priority order (best = lowest at head)
-        if prio < prios[head as usize] {
-            // New head: insert before current head
-            let tail = prevs[head as usize];
-            nexts[idx as usize] = head;
-            prevs[idx as usize] = tail;
-            nexts[tail as usize] = idx;
-            prevs[head as usize] = idx;
-            self.buckets[hash] = idx;
-        } else {
-            // Insert in sorted position (scan backwards from tail)
-            let tail = prevs[head as usize];
-            let mut pos = tail;
-            while pos != head && prio < prios[pos as usize] {
-                pos = prevs[pos as usize];
-            }
-            // Insert after pos
-            let after = nexts[pos as usize];
-            nexts[pos as usize] = idx;
-            nexts[idx as usize] = after;
-            prevs[after as usize] = idx;
-            prevs[idx as usize] = pos;
-        }
+    pub fn add_waiter(&mut self, hash: usize, idx: u32, prio: u8) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.buckets[hash].push(Reverse((prio, seq, idx)));
     }
 
-    /// Remove the first waiter matching `futex_lo` from the hash bucket.
+    /// Remove the first (best-priority) waiter matching `futex_lo` from the
+    /// hash bucket.
     ///
-    /// Returns the index of the removed waiter, or IDX_NONE if not found.
-    pub fn remove_one(
-        &mut self,
-        hash: usize,
-        futex_lo: u32,
-        futex_ptrs: &[u32],
-        nexts: &mut [u32],
-        prevs: &mut [u32],
-    ) -> u32 {
-        let head = self.buckets[hash];
-        if head == IDX_NONE {
-            return IDX_NONE;
-        }
+    /// Returns the index of the removed waiter, or `IDX_NONE` if not found.
+    pub fn remove_one(&mut self, hash: usize, futex_lo: u32, futex_ptrs: &[u32]) -> u32 {
+        let bucket = &mut self.buckets[hash];
+        let mut pending = alloc::vec::Vec::new();
+        let mut found = IDX_NONE;
 
-        let mut cur = head;
-        loop {
-            if futex_ptrs[cur as usize] == futex_lo {
-                // Found: remove from ring
-                let next = nexts[cur as usize];
-                let prev = prevs[cur as usize];
-
-                if next == cur {
-                    // Only element
-                    self.buckets[hash] = IDX_NONE;
-                } else {
-                    nexts[prev as usize] = next;
-                    prevs[next as usize] = prev;
-                    if cur == head {
-                        self.buckets[hash] = next;
-                    }
-                }
-                nexts[cur as usize] = IDX_NONE;
-                prevs[cur as usize] = IDX_NONE;
-                return cur;
-            }
-            cur = nexts[cur as usize];
-            if cur == head {
-                break;
+        while let Some(Reverse((prio, seq, idx))) = bucket.pop() {
+            if found == IDX_NONE && futex_ptrs[idx as usize] == futex_lo {
+                found = idx;
+            } else {
+                pending.push(Reverse((prio, seq, idx)));
             }
         }
-        IDX_NONE
+        bucket.extend(pending);
+        found
     }
 
     /// Remove a specific thread from its hash bucket.
     ///
     /// Used by futex_cancel to remove a blocked thread.
-    pub fn cancel(&mut self, hash: usize, idx: u32, nexts: &mut [u32], prevs: &mut [u32]) {
-        let head = self.buckets[hash];
-        if head == IDX_NONE {
-            return;
-        }
-
-        let next = nexts[idx as usize];
-        let prev = prevs[idx as usize];
-
-        if next == idx {
-            // Only element
-            self.buckets[hash] = IDX_NONE;
-        } else {
-            nexts[prev as usize] = next;
-            prevs[next as usize] = prev;
-            if idx == head {
-                self.buckets[hash] = next;
-            }
-        }
-        nexts[idx as usize] = IDX_NONE;
-        prevs[idx as usize] = IDX_NONE;
+    pub fn cancel(&mut self, hash: usize, idx: u32) {
+        let bucket = &mut self.buckets[hash];
+        let remaining: BinaryHeap<Entry> = bucket
+            .drain()
+            .filter(|&Reverse((_, _, entry_idx))| entry_idx != idx)
+            .collect();
+        *bucket = remaining;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
     fn test_futex_hash_distribution() {
@@ -196,70 +129,59 @@ mod tests {
     #[test]
     fn test_futex_add_and_remove() {
         let mut table = FutexTable::new();
-        let mut nexts = vec![IDX_NONE; 8];
-        let mut prevs = vec![IDX_NONE; 8];
-        let prios = vec![0u8; 8];
-        let futex_ptrs = vec![0x1000u32, 0x1000, 0x1000, 0x2000, 0, 0, 0, 0];
+        let futex_ptrs = [0x1000u32, 0x1000, 0x1000, 0x2000, 0, 0, 0, 0];
 
         let hash = 5; // arbitrary bucket
 
         // Add waiter 1 and 2 for futex 0x1000
-        table.add_waiter(hash, 1, 10, &mut nexts, &mut prevs, &prios);
-        table.add_waiter(hash, 2, 10, &mut nexts, &mut prevs, &prios);
+        table.add_waiter(hash, 1, 10);
+        table.add_waiter(hash, 2, 10);
 
         // Remove first matching 0x1000
-        let removed = table.remove_one(hash, 0x1000, &futex_ptrs, &mut nexts, &mut prevs);
+        let removed = table.remove_one(hash, 0x1000, &futex_ptrs);
         assert_eq!(removed, 1);
 
         // Remove next matching 0x1000
-        let removed = table.remove_one(hash, 0x1000, &futex_ptrs, &mut nexts, &mut prevs);
+        let removed = table.remove_one(hash, 0x1000, &futex_ptrs);
         assert_eq!(removed, 2);
 
         // No more
-        let removed = table.remove_one(hash, 0x1000, &futex_ptrs, &mut nexts, &mut prevs);
+        let removed = table.remove_one(hash, 0x1000, &futex_ptrs);
         assert_eq!(removed, IDX_NONE);
     }
 
     #[test]
     fn test_futex_priority_ordering() {
         let mut table = FutexTable::new();
-        let mut nexts = vec![IDX_NONE; 8];
-        let mut prevs = vec![IDX_NONE; 8];
-        let prios = vec![0u8, 20, 10, 30, 0, 0, 0, 0];
-        let futex_ptrs = vec![0u32, 0x1000, 0x1000, 0x1000, 0, 0, 0, 0];
+        let futex_ptrs = [0u32, 0x1000, 0x1000, 0x1000, 0, 0, 0, 0];
 
         let hash = 3;
 
         // Add in order: prio 20, 10, 30
-        table.add_waiter(hash, 1, 20, &mut nexts, &mut prevs, &prios);
-        table.add_waiter(hash, 2, 10, &mut nexts, &mut prevs, &prios);
-        table.add_waiter(hash, 3, 30, &mut nexts, &mut prevs, &prios);
+        table.add_waiter(hash, 1, 20);
+        table.add_waiter(hash, 2, 10);
+        table.add_waiter(hash, 3, 30);
 
-        // Head should be prio 10 (index 2)
-        assert_eq!(table.buckets[hash], 2);
-
-        // Remove first → should be prio 10
-        let removed = table.remove_one(hash, 0x1000, &futex_ptrs, &mut nexts, &mut prevs);
+        // Remove first → should be prio 10 (thread 2)
+        let removed = table.remove_one(hash, 0x1000, &futex_ptrs);
         assert_eq!(removed, 2);
     }
 
     #[test]
     fn test_futex_cancel() {
         let mut table = FutexTable::new();
-        let mut nexts = vec![IDX_NONE; 8];
-        let mut prevs = vec![IDX_NONE; 8];
-        let prios = vec![0u8; 8];
 
         let hash = 7;
 
-        table.add_waiter(hash, 1, 10, &mut nexts, &mut prevs, &prios);
-        table.add_waiter(hash, 2, 10, &mut nexts, &mut prevs, &prios);
+        table.add_waiter(hash, 1, 10);
+        table.add_waiter(hash, 2, 10);
 
         // Cancel thread 1
-        table.cancel(hash, 1, &mut nexts, &mut prevs);
+        table.cancel(hash, 1);
 
         // Only thread 2 should remain
-        assert_eq!(table.buckets[hash], 2);
-        assert_eq!(nexts[2], 2); // self-loop
+        assert_eq!(table.buckets[hash].len(), 1);
+        let futex_ptrs = [0u32; 8];
+        assert_eq!(table.remove_one(hash, futex_ptrs[2], &futex_ptrs), 2);
     }
 }
