@@ -5,8 +5,10 @@
 
 //! Kernel error codes.
 
+use strum::FromRepr;
+
 /// VM error codes returned to guests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
 #[repr(i32)]
 pub enum VmError {
     Ok = 0,
@@ -20,20 +22,6 @@ pub enum VmError {
 }
 
 impl VmError {
-    pub const fn from_raw(val: i32) -> Option<Self> {
-        match val {
-            0 => Some(Self::Ok),
-            -1 => Some(Self::BadArg),
-            -2 => Some(Self::NoMem),
-            -3 => Some(Self::NotFound),
-            -4 => Some(Self::Busy),
-            -5 => Some(Self::NoPermission),
-            -6 => Some(Self::BadState),
-            -7 => Some(Self::NotSupported),
-            _ => None,
-        }
-    }
-
     pub const fn is_ok(self) -> bool {
         matches!(self, Self::Ok)
     }

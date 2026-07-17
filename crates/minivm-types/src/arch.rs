@@ -39,12 +39,12 @@ impl ArchVersion {
 
     /// Whether the architecture has the DM0 register (v68+).
     pub const fn has_dm0(self) -> bool {
-        matches!(self, Self::V68 | Self::V73 | Self::V81)
+        self as u8 >= Self::V68 as u8
     }
 
     /// Whether the architecture has the VWCTRL register (v73+).
     pub const fn has_vwctrl(self) -> bool {
-        matches!(self, Self::V73 | Self::V81)
+        self as u8 >= Self::V73 as u8
     }
 
     /// Maximum page size supported.
