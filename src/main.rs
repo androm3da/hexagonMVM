@@ -14,6 +14,10 @@
 #![cfg_attr(target_arch = "hexagon", feature(asm_experimental_arch))]
 #![allow(static_mut_refs)]
 
+extern crate alloc;
+
+use buddy_system_allocator::LockedHeap;
+
 mod debug;
 #[cfg(target_arch = "hexagon")]
 mod hexagon_abi;
@@ -21,6 +25,13 @@ mod panic;
 mod semihosting;
 #[cfg(feature = "run-tests")]
 mod tests;
+
+/// Global heap allocator, backed by the linker-reserved `.heap` region
+/// (`__heap_start`..`__heap_end` in minivm.ld). Initialized in
+/// `minivm_main` before any subsystem that allocates (scheduler, futex,
+/// timer) is constructed.
+#[global_allocator]
+static ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 
 // Entry point: exception vector table + startup code (src/entry.S)
 #[cfg(target_arch = "hexagon")]
@@ -1312,17 +1323,16 @@ pub extern "C" fn minivm_trap0_vmop_handler(ctx_ptr: *mut ThreadContext) -> u32 
 
             // Allocate ASID using VM's configured phys_offset (set by SET_PMAP_TYPE)
             let asid_table = unsafe { &mut *ASID_TABLE_MUT_PTR };
-            let asid = asid_table.inc(
+            let Some(asid) = asid_table.inc(
                 vm.phys_offset.0,
                 TranslationType::Offset,
                 false,
                 0,
                 vm.vmidx as u8,
                 |_| {},
-            );
-            if asid < 0 {
+            ) else {
                 return 0xFFFF_FFFF;
-            }
+            };
 
             // Wire up globals for TLB miss handler
             unsafe {
@@ -1887,17 +1897,16 @@ pub(crate) fn vmboot(
     // 1. Allocate ASID with identity offset (same as C identity_offset)
     //    size=6, cccc=7 (L1WB_L2C), weak_ccc=true, xwru=0xF (URWX), pages=0
     let identity_offset = OffsetConfig::new(6, 7, true, 0xF, 0);
-    let asid = asid_table.inc(
+    let Some(asid) = asid_table.inc(
         identity_offset.0,
         TranslationType::Offset,
         false,
         0,
         vm.vmidx as u8,
         |_| {},
-    );
-    if asid < 0 {
+    ) else {
         return 0xFFFF_FFFF;
-    }
+    };
 
     // 2. Wire up global pointers for TLB miss handler and guest trap handler
     unsafe {
@@ -2248,8 +2257,21 @@ pub extern "C" fn minivm_main(fdt_phys: u64) -> ! {
         12 // default: must match qemu_virt.dts: gpt interrupts = <12 0>
     };
 
+    debug::write0(b"  [init] heap allocator\n\0");
+    // Reserved by minivm.ld's `.heap` NOLOAD section. Must run before any
+    // subsystem that allocates (scheduler ready list, futex table, timer).
+    extern "C" {
+        static mut __heap_start: u8;
+        static mut __heap_end: u8;
+    }
+    unsafe {
+        let heap_start = core::ptr::addr_of_mut!(__heap_start) as usize;
+        let heap_end = core::ptr::addr_of_mut!(__heap_end) as usize;
+        ALLOCATOR.lock().init(heap_start, heap_end - heap_start);
+    }
+
     debug::write0(b"  [init] scheduler\n\0");
-    let readylist = ReadyList::new();
+    let mut readylist = ReadyList::new();
     let runlist = RunList::new(kg.hthreads);
     let _lowprio = LowPrio::new();
     assert_eq!(readylist.best_prio(), minivm_types::consts::MAX_PRIOS);
