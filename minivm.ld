@@ -59,7 +59,7 @@ SECTIONS
     .heap (NOLOAD) : ALIGN(32)
     {
         __heap_start = .;
-        . += 0x20000;  /* 128KB kernel heap */
+        . += 0x100000;  /* 1MB kernel heap */
         __heap_end = .;
     } > KERNEL
 

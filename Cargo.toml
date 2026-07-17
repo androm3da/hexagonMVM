@@ -48,6 +48,7 @@ minivm-types = { path = "crates/minivm-types" }
 minivm-vm = { path = "crates/minivm-vm" }
 fdt = { version = "0.1", default-features = false }
 log_buffer = { version = "1.2", default-features = false, optional = true }
+buddy_system_allocator = { version = "0.13.0", default-features = false, features = ["use_spin"] }
 
 [profile.release]
 opt-level = "s"
