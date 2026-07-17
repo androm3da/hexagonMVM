@@ -5,25 +5,27 @@
 
 //! Timer trap handler and timeout management.
 //!
-//! The timer subsystem manages per-thread timeouts via a binary search
-//! tree and provides a guest-facing API for time queries and timeout
-//! operations.
+//! The timer subsystem manages per-thread timeouts via a min-heap and
+//! provides a guest-facing API for time queries and timeout operations.
 
-use crate::tree::{TimeoutTree, TreeIdx, TreeNode, IDX_NONE};
+use crate::tree::{TimeoutTree, TreeIdx, TreeNode};
 use minivm_types::consts::MINIVM_TIME_GUESTINT;
 use minivm_types::timer::TimerOp;
 
-/// Sentinel: timeout disabled / no timeout set.
-pub const TIME_BIGBANG: u64 = 0;
 /// Sentinel: far future / no hardware timeout needed.
 pub const TIME_FOREVER: u64 = !0u64;
 
 /// Default tick granularity (minimum meaningful interval).
 pub const TICK_GRANULARITY: u64 = 4;
 
-/// Default nanoseconds per tick (architecture-dependent, v65+).
+/// Nanoseconds per tick. Fixed for all supported architectures (v65+); the
+/// Hexagon QTIMER hardware always runs at 19.2MHz (see `TICK_REALFREQ`
+/// below and the QTIMER init in `src/main.rs`), so this is not a
+/// per-architecture value.
 pub const NSEC_PER_TICK: u64 = 52;
-/// Default tick frequency in Hz.
+/// Tick frequency in Hz, matching the Hexagon QTIMER hardware clock
+/// (19.2MHz on all supported targets, including QEMU's `qemu_virt` machine
+/// and the hexagon-sim cosim QTIMER).
 pub const TICK_REALFREQ: u64 = 19_200_000;
 /// Nanosecond-scale frequency.
 pub const NSEC_FREQ: u64 = TICK_REALFREQ * NSEC_PER_TICK;
@@ -48,7 +50,7 @@ impl TimerState {
     pub const fn new() -> Self {
         Self {
             next_ticks: TIME_FOREVER,
-            last_ticks: TIME_BIGBANG,
+            last_ticks: 0,
             timeouts: TimeoutTree::new(),
         }
     }
@@ -57,7 +59,8 @@ impl TimerState {
     ///
     /// `op`: the timer operation requested
     /// `arg`: 64-bit argument (nanoseconds for set/delta, unused otherwise)
-    /// `timeout_key`: the thread's current timeout key (from tree node)
+    /// `timeout_key`: the thread's current timeout key (`None` if no timeout
+    /// is armed), from the tree node
     /// `nodes`: the tree node storage
     /// `thread_idx`: the thread's tree node index
     ///
@@ -66,7 +69,7 @@ impl TimerState {
         &mut self,
         op: TimerOp,
         arg: u64,
-        timeout_key: u64,
+        timeout_key: Option<u64>,
         nodes: &mut [TreeNode],
         thread_idx: TreeIdx,
     ) -> TimerTrapResult {
@@ -77,66 +80,72 @@ impl TimerState {
                 let ticks = self.last_ticks;
                 TimerTrapResult::value(ticks2ns(ticks))
             }
-            TimerOp::GetTimeout => TimerTrapResult::value(ticks2ns(timeout_key)),
+            TimerOp::GetTimeout => TimerTrapResult::value(ticks2ns(timeout_key.unwrap_or(0))),
             TimerOp::SetTimeout => {
+                // arg == TIME_FOREVER means "disable the timeout".
                 let timeout_tick = if arg == TIME_FOREVER {
-                    TIME_BIGBANG
+                    None
                 } else {
-                    ns2ticks(arg)
+                    Some(ns2ticks(arg))
                 };
                 self.set_timeout_tick(timeout_tick, timeout_key, nodes, thread_idx)
             }
             TimerOp::DeltaTimeout => {
                 if arg == TIME_FOREVER {
-                    self.set_timeout_tick(TIME_BIGBANG, timeout_key, nodes, thread_idx)
+                    self.set_timeout_tick(None, timeout_key, nodes, thread_idx)
                 } else {
                     let delta_ticks = ns2ticks(arg).max(TICK_GRANULARITY);
                     let timeout_tick = self.last_ticks.saturating_add(delta_ticks);
-                    self.set_timeout_tick(timeout_tick, timeout_key, nodes, thread_idx)
+                    self.set_timeout_tick(Some(timeout_tick), timeout_key, nodes, thread_idx)
                 }
             }
         }
     }
 
-    /// Set a thread's timeout to an absolute tick value.
+    /// Set a thread's timeout to an absolute tick value, or disable it.
+    ///
+    /// `timeout_tick`: `Some(tick)` to arm the timeout at `tick`, or `None`
+    /// to disable it. `TIME_FOREVER` is only ever an *input* sentinel from
+    /// callers requesting "wait indefinitely without a timeout"; it is
+    /// translated to `None` before reaching this function, never stored as
+    /// a tick value.
     ///
     /// Returns the result with the new timeout value and whether HW needs update.
     fn set_timeout_tick(
         &mut self,
-        timeout_tick: u64,
-        old_key: u64,
+        timeout_tick: Option<u64>,
+        old_key: Option<u64>,
         nodes: &mut [TreeNode],
         thread_idx: TreeIdx,
     ) -> TimerTrapResult {
-        let timeout_tick = if timeout_tick != TIME_BIGBANG && timeout_tick <= self.last_ticks {
-            TIME_BIGBANG
-        } else {
-            timeout_tick
-        };
+        // A timeout at or before the current time already elapsed; treat it
+        // as disabled rather than arming an already-expired timer.
+        let timeout_tick = timeout_tick.filter(|&tick| tick > self.last_ticks);
 
         // Remove existing timeout if active
-        if old_key != TIME_BIGBANG {
-            self.timeouts.remove(nodes, thread_idx, old_key);
+        if let Some(old) = old_key {
+            self.timeouts.remove(nodes, thread_idx, old);
         }
 
         // Set new timeout
-        if timeout_tick != TIME_BIGBANG {
-            self.timeouts.add(nodes, thread_idx, timeout_tick);
-            let needs_hw = timeout_tick < self.next_ticks;
-            if needs_hw {
-                self.next_ticks = timeout_tick;
+        match timeout_tick {
+            Some(tick) => {
+                self.timeouts.add(nodes, thread_idx, tick);
+                let needs_hw = tick < self.next_ticks;
+                if needs_hw {
+                    self.next_ticks = tick;
+                }
+                TimerTrapResult {
+                    value: ticks2ns(tick),
+                    new_timeout_key: Some(tick),
+                    needs_hw_update: needs_hw,
+                }
             }
-            TimerTrapResult {
-                value: ticks2ns(timeout_tick),
-                new_timeout_key: timeout_tick,
-                needs_hw_update: needs_hw,
-            }
-        } else {
-            TimerTrapResult {
-                value: ticks2ns(TIME_BIGBANG),
-                new_timeout_key: TIME_BIGBANG,
+            None => TimerTrapResult {
+                value: 0,
+                new_timeout_key: None,
                 needs_hw_update: false,
-            }
+            },
         }
     }
 
@@ -152,21 +161,9 @@ impl TimerState {
         nodes: &mut [TreeNode],
         expired: &mut impl FnMut(TreeIdx),
     ) {
-        let (mut le, gt) = self.timeouts.bisect(nodes, now_ticks);
-
-        // Find next timeout from remaining tree
-        let min_idx = gt.min(nodes);
-        self.next_ticks = if min_idx != IDX_NONE {
-            nodes[min_idx as usize].key
-        } else {
-            TIME_FOREVER
-        };
-
-        // Replace timeout tree with pending timeouts only
-        self.timeouts = gt;
-
-        // Process expired timeouts
-        le.collect_and_clear(nodes, expired);
+        let _ = nodes;
+        let next_key = self.timeouts.pop_expired(now_ticks, expired);
+        self.next_ticks = next_key.unwrap_or(TIME_FOREVER);
     }
 
     /// Update last known time.
@@ -181,8 +178,8 @@ impl TimerState {
 pub struct TimerTrapResult {
     /// Return value (nanoseconds).
     pub value: u64,
-    /// New timeout key for the thread (0 = disabled).
-    pub new_timeout_key: u64,
+    /// New timeout key for the thread (`None` = disabled).
+    pub new_timeout_key: Option<u64>,
     /// Whether the hardware timer needs to be rescheduled.
     pub needs_hw_update: bool,
 }
@@ -191,7 +188,7 @@ impl TimerTrapResult {
     fn value(v: u64) -> Self {
         Self {
             value: v,
-            new_timeout_key: TIME_BIGBANG,
+            new_timeout_key: None,
             needs_hw_update: false,
         }
     }
@@ -228,7 +225,7 @@ mod tests {
     fn test_timer_get_freq() {
         let mut state = TimerState::new();
         let mut nodes = make_nodes(4);
-        let r = state.timer_trap(TimerOp::GetFreq, 0, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::GetFreq, 0, None, &mut nodes, 1);
         assert_eq!(r.value, NSEC_FREQ);
     }
 
@@ -236,7 +233,7 @@ mod tests {
     fn test_timer_get_resolution() {
         let mut state = TimerState::new();
         let mut nodes = make_nodes(4);
-        let r = state.timer_trap(TimerOp::GetResolution, 0, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::GetResolution, 0, None, &mut nodes, 1);
         assert_eq!(r.value, NSEC_PER_TICK);
     }
 
@@ -245,7 +242,7 @@ mod tests {
         let mut state = TimerState::new();
         let mut nodes = make_nodes(4);
         state.last_ticks = 1000;
-        let r = state.timer_trap(TimerOp::GetTime, 0, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::GetTime, 0, None, &mut nodes, 1);
         assert_eq!(r.value, 1000 * NSEC_PER_TICK);
     }
 
@@ -257,9 +254,9 @@ mod tests {
 
         // Set timeout to 10000 ns → 192 ticks
         let ns = 10000u64;
-        let r = state.timer_trap(TimerOp::SetTimeout, ns, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::SetTimeout, ns, None, &mut nodes, 1);
         let expected_ticks = ns / NSEC_PER_TICK;
-        assert_eq!(r.new_timeout_key, expected_ticks);
+        assert_eq!(r.new_timeout_key, Some(expected_ticks));
         assert!(r.needs_hw_update); // Should need HW update
     }
 
@@ -270,8 +267,8 @@ mod tests {
         state.last_ticks = 1000;
 
         // Set timeout in the past → should be disabled
-        let r = state.timer_trap(TimerOp::SetTimeout, 50, TIME_BIGBANG, &mut nodes, 1);
-        assert_eq!(r.new_timeout_key, TIME_BIGBANG);
+        let r = state.timer_trap(TimerOp::SetTimeout, 50, None, &mut nodes, 1);
+        assert_eq!(r.new_timeout_key, None);
     }
 
     #[test]
@@ -281,9 +278,9 @@ mod tests {
         state.last_ticks = 100;
 
         // Delta timeout of 1000 ns
-        let r = state.timer_trap(TimerOp::DeltaTimeout, 1000, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::DeltaTimeout, 1000, None, &mut nodes, 1);
         let delta_ticks = (1000u64 / NSEC_PER_TICK).max(TICK_GRANULARITY);
-        assert_eq!(r.new_timeout_key, 100 + delta_ticks);
+        assert_eq!(r.new_timeout_key, Some(100 + delta_ticks));
     }
 
     #[test]
@@ -293,13 +290,13 @@ mod tests {
         state.last_ticks = 100;
 
         // Set a timeout
-        let r = state.timer_trap(TimerOp::SetTimeout, 100000, TIME_BIGBANG, &mut nodes, 1);
+        let r = state.timer_trap(TimerOp::SetTimeout, 100000, None, &mut nodes, 1);
         let old_key = r.new_timeout_key;
-        assert_ne!(old_key, TIME_BIGBANG);
+        assert!(old_key.is_some());
 
         // Cancel with TIME_FOREVER
         let r = state.timer_trap(TimerOp::SetTimeout, TIME_FOREVER, old_key, &mut nodes, 1);
-        assert_eq!(r.new_timeout_key, TIME_BIGBANG);
+        assert_eq!(r.new_timeout_key, None);
     }
 
     #[test]

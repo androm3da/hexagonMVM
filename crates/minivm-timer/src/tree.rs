@@ -3,15 +3,17 @@
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 
-//! Binary search tree for timeout management.
+//! Timeout min-heap for timer management.
 //!
-//! The tree stores timeout nodes keyed by expiration time (ticks).
-//! Key operations:
-//! - `add`: Insert a node by key
-//! - `remove`: Remove a node by key
-//! - `bisect`: Split tree into expired (≤ key) and pending (> key) subtrees
-//! - `destructive_iterate`: In-order traversal with callback, destroys tree
-//! - `min`: Find minimum key node (soonest timeout)
+//! Timeout entries are kept in a `BinaryHeap` keyed by expiration time
+//! (ticks), so the soonest timeout is always at the head. `remove` (needed
+//! when a thread's timeout is cancelled or replaced before it expires) has
+//! no O(1) equivalent on a `BinaryHeap`; since removal only happens on
+//! `SetTimeout`/`DeltaTimeout` — not once per tick — it rebuilds the heap
+//! via drain-and-filter rather than tracking a side table.
+
+use alloc::collections::BinaryHeap;
+use core::cmp::Reverse;
 
 /// Index of a tree node, or `IDX_NONE` for null.
 pub type TreeIdx = u32;
@@ -29,18 +31,21 @@ pub struct TreeNode {
     pub key: u64,
 }
 
-/// A timeout tree (BST) keyed by expiration ticks.
-///
-/// Uses index-based nodes stored in an external array.
-/// The `root` field is the index of the root node, or `IDX_NONE`.
+/// Heap entry: `(expiration key, thread index)`. Lower key sorts first
+/// (soonest timeout).
+type Entry = Reverse<(u64, TreeIdx)>;
+
+/// A timeout min-heap, keyed by expiration ticks.
 #[derive(Debug, Default)]
 pub struct TimeoutTree {
-    pub root: TreeIdx,
+    heap: BinaryHeap<Entry>,
 }
 
 impl TimeoutTree {
     pub const fn new() -> Self {
-        Self { root: IDX_NONE }
+        Self {
+            heap: BinaryHeap::new(),
+        }
     }
 
     /// Insert a node into the tree with the given key.
@@ -48,152 +53,63 @@ impl TimeoutTree {
         nodes[idx as usize].key = key;
         nodes[idx as usize].left = IDX_NONE;
         nodes[idx as usize].right = IDX_NONE;
-        self.root = Self::insert(nodes, self.root, idx);
-    }
-
-    fn insert(nodes: &mut [TreeNode], root: TreeIdx, idx: TreeIdx) -> TreeIdx {
-        if root == IDX_NONE {
-            return idx;
-        }
-        if nodes[idx as usize].key <= nodes[root as usize].key {
-            let left = nodes[root as usize].left;
-            nodes[root as usize].left = Self::insert(nodes, left, idx);
-        } else {
-            let right = nodes[root as usize].right;
-            nodes[root as usize].right = Self::insert(nodes, right, idx);
-        }
-        root
+        self.heap.push(Reverse((key, idx)));
     }
 
     /// Remove a node with the given key from the tree.
-    pub fn remove(&mut self, nodes: &mut [TreeNode], idx: TreeIdx, key: u64) {
-        self.root = Self::remove_impl(nodes, self.root, idx, key);
-    }
-
-    fn remove_impl(nodes: &mut [TreeNode], root: TreeIdx, idx: TreeIdx, key: u64) -> TreeIdx {
-        if root == IDX_NONE {
-            return IDX_NONE;
-        }
-        if root == idx {
-            // Found the node to remove. Promote left, insert right subtree.
-            let left = nodes[root as usize].left;
-            let right = nodes[root as usize].right;
-            nodes[root as usize].left = IDX_NONE;
-            nodes[root as usize].right = IDX_NONE;
-            if right == IDX_NONE {
-                return left;
-            }
-            if left == IDX_NONE {
-                return right;
-            }
-            // Insert right subtree (intact, with its children) into left
-            return Self::insert(nodes, left, right);
-        }
-        if key <= nodes[root as usize].key {
-            let left = nodes[root as usize].left;
-            nodes[root as usize].left = Self::remove_impl(nodes, left, idx, key);
-        } else {
-            let right = nodes[root as usize].right;
-            nodes[root as usize].right = Self::remove_impl(nodes, right, idx, key);
-        }
-        root
-    }
-
-    /// Split the tree into two subtrees:
-    /// - `le_tree`: nodes with key ≤ split_key (expired)
-    /// - `gt_tree`: nodes with key > split_key (pending)
-    ///
-    /// Returns (le_tree, gt_tree).
-    pub fn bisect(&mut self, nodes: &mut [TreeNode], split_key: u64) -> (TimeoutTree, TimeoutTree) {
-        let mut le = TimeoutTree::new();
-        let mut gt = TimeoutTree::new();
-        let root = self.root;
-        self.root = IDX_NONE;
-        Self::bisect_impl(nodes, root, split_key, &mut le, &mut gt);
-        (le, gt)
-    }
-
-    /// Efficient O(n) top-down "unzip" split.
-    ///
-    /// Splits the BST in a single pass: when a node's key <= split_key,
-    /// the node (and its entire left subtree) goes to `le`, and we continue
-    /// splitting its right subtree. Vice versa for nodes > split_key.
-    fn bisect_impl(
-        nodes: &mut [TreeNode],
-        mut cur: TreeIdx,
-        split_key: u64,
-        le: &mut TimeoutTree,
-        gt: &mut TimeoutTree,
-    ) {
-        // le_attach / gt_attach track which node's child pointer to update next.
-        // `None` means update the tree root; `Some((idx, is_right))` means update
-        // nodes[idx].right (if is_right) or nodes[idx].left.
-        let mut le_attach: Option<(usize, bool)> = None;
-        let mut gt_attach: Option<(usize, bool)> = None;
-
-        while cur != IDX_NONE {
-            if nodes[cur as usize].key <= split_key {
-                // This node (and its left subtree) go to le
-                match le_attach {
-                    None => le.root = cur,
-                    Some((idx, true)) => nodes[idx].right = cur,
-                    Some((idx, false)) => nodes[idx].left = cur,
-                }
-                // Continue splitting the right subtree
-                let right = nodes[cur as usize].right;
-                nodes[cur as usize].right = IDX_NONE;
-                le_attach = Some((cur as usize, true)); // next le node attaches to cur.right
-                cur = right;
-            } else {
-                // This node (and its right subtree) go to gt
-                match gt_attach {
-                    None => gt.root = cur,
-                    Some((idx, true)) => nodes[idx].right = cur,
-                    Some((idx, false)) => nodes[idx].left = cur,
-                }
-                // Continue splitting the left subtree
-                let left = nodes[cur as usize].left;
-                nodes[cur as usize].left = IDX_NONE;
-                gt_attach = Some((cur as usize, false)); // next gt node attaches to cur.left
-                cur = left;
-            }
-        }
+    pub fn remove(&mut self, _nodes: &mut [TreeNode], idx: TreeIdx, key: u64) {
+        let remaining: BinaryHeap<Entry> = self
+            .heap
+            .drain()
+            .filter(|&Reverse((k, i))| !(k == key && i == idx))
+            .collect();
+        self.heap = remaining;
     }
 
     /// Find the minimum key node (soonest timeout).
     ///
     /// Returns the node index, or `IDX_NONE` if empty.
     pub fn min(&self, nodes: &[TreeNode]) -> TreeIdx {
-        let mut cur = self.root;
-        if cur == IDX_NONE {
-            return IDX_NONE;
+        let _ = nodes;
+        match self.heap.peek() {
+            Some(&Reverse((_, idx))) => idx,
+            None => IDX_NONE,
         }
-        while nodes[cur as usize].left != IDX_NONE {
-            cur = nodes[cur as usize].left;
-        }
-        cur
     }
 
-    /// Iterate all nodes in-order, collecting indices.
+    /// Iterate all nodes in ascending-key order, collecting indices.
     ///
-    /// This destroys the tree (sets root to IDX_NONE after iteration).
+    /// This destroys the tree (drains the heap).
     pub fn collect_and_clear(&mut self, nodes: &[TreeNode], out: &mut impl FnMut(TreeIdx)) {
-        Self::iterate_inorder(nodes, self.root, out);
-        self.root = IDX_NONE;
+        let _ = nodes;
+        let mut entries: alloc::vec::Vec<Entry> = self.heap.drain().collect();
+        entries.sort_by_key(|&Reverse((key, idx))| (key, idx));
+        for Reverse((_, idx)) in entries {
+            out(idx);
+        }
     }
 
-    fn iterate_inorder(nodes: &[TreeNode], root: TreeIdx, out: &mut impl FnMut(TreeIdx)) {
-        if root == IDX_NONE {
-            return;
+    /// Pop all entries with key `<= split_key` (soonest first), invoking
+    /// `expired` for each. Returns the key of the next remaining (pending)
+    /// timeout, or `None` if the tree is now empty.
+    pub fn pop_expired(
+        &mut self,
+        split_key: u64,
+        expired: &mut impl FnMut(TreeIdx),
+    ) -> Option<u64> {
+        while let Some(&Reverse((key, idx))) = self.heap.peek() {
+            if key > split_key {
+                break;
+            }
+            self.heap.pop();
+            expired(idx);
         }
-        Self::iterate_inorder(nodes, nodes[root as usize].left, out);
-        out(root);
-        Self::iterate_inorder(nodes, nodes[root as usize].right, out);
+        self.heap.peek().map(|&Reverse((key, _))| key)
     }
 
     /// Check if the tree is empty.
     pub fn is_empty(&self) -> bool {
-        self.root == IDX_NONE
+        self.heap.is_empty()
     }
 }
 
@@ -252,32 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bisect() {
-        let mut tree = TimeoutTree::new();
-        let mut nodes = make_nodes(8);
-
-        tree.add(&mut nodes, 1, 10);
-        tree.add(&mut nodes, 2, 20);
-        tree.add(&mut nodes, 3, 30);
-        tree.add(&mut nodes, 4, 40);
-        tree.add(&mut nodes, 5, 50);
-
-        // Split at key=25: le={10,20}, gt={30,40,50}
-        let (mut le, gt) = tree.bisect(&mut nodes, 25);
-        assert!(tree.is_empty());
-
-        // Check le
-        let mut le_items = Vec::new();
-        le.collect_and_clear(&nodes, &mut |idx| le_items.push(idx));
-        assert_eq!(le_items.len(), 2);
-        // Values should be 10 and 20 (in order)
-        assert!(le_items.iter().all(|&i| nodes[i as usize].key <= 25));
-
-        // Check gt
-        assert_eq!(gt.min(&nodes), 3); // key=30 is min of gt
-    }
-
-    #[test]
     fn test_collect_and_clear() {
         let mut tree = TimeoutTree::new();
         let mut nodes = make_nodes(8);
@@ -313,33 +203,52 @@ mod tests {
     }
 
     #[test]
-    fn test_bisect_all_expired() {
+    fn test_pop_expired_partial() {
+        let mut tree = TimeoutTree::new();
+        let mut nodes = make_nodes(8);
+
+        tree.add(&mut nodes, 1, 10);
+        tree.add(&mut nodes, 2, 20);
+        tree.add(&mut nodes, 3, 30);
+        tree.add(&mut nodes, 4, 40);
+        tree.add(&mut nodes, 5, 50);
+
+        // Split at key=25: expired={10,20}, pending next key=30
+        let mut expired = Vec::new();
+        let next_key = tree.pop_expired(25, &mut |idx| expired.push(idx));
+        assert_eq!(expired.len(), 2);
+        assert!(expired.iter().all(|&i| nodes[i as usize].key <= 25));
+        assert_eq!(next_key, Some(30));
+        assert_eq!(tree.min(&nodes), 3); // key=30 is min of what remains
+    }
+
+    #[test]
+    fn test_pop_expired_all() {
         let mut tree = TimeoutTree::new();
         let mut nodes = make_nodes(8);
 
         tree.add(&mut nodes, 1, 10);
         tree.add(&mut nodes, 2, 20);
 
-        let (mut le, gt) = tree.bisect(&mut nodes, 100);
-
-        let mut le_items = Vec::new();
-        le.collect_and_clear(&nodes, &mut |idx| le_items.push(idx));
-        assert_eq!(le_items.len(), 2);
-        assert!(gt.is_empty());
+        let mut expired = Vec::new();
+        let next_key = tree.pop_expired(100, &mut |idx| expired.push(idx));
+        assert_eq!(expired.len(), 2);
+        assert_eq!(next_key, None);
+        assert!(tree.is_empty());
     }
 
     #[test]
-    fn test_bisect_none_expired() {
+    fn test_pop_expired_none() {
         let mut tree = TimeoutTree::new();
         let mut nodes = make_nodes(8);
 
         tree.add(&mut nodes, 1, 100);
         tree.add(&mut nodes, 2, 200);
 
-        let (le, gt) = tree.bisect(&mut nodes, 50);
-
-        assert!(le.is_empty());
-        assert!(!gt.is_empty());
-        assert_eq!(gt.min(&nodes), 1); // key=100
+        let mut expired = Vec::new();
+        let next_key = tree.pop_expired(50, &mut |idx| expired.push(idx));
+        assert!(expired.is_empty());
+        assert_eq!(next_key, Some(100));
+        assert_eq!(tree.min(&nodes), 1); // key=100
     }
 }
