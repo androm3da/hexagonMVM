@@ -71,13 +71,10 @@ pub fn linear_translate(
             } else {
                 list_ppn = list_gpn;
             }
-
-            list_pa = (list_ppn as u64) << PAGE_BITS;
-            list_pa |= (list & ((1 << PAGE_BITS) - 1)) as u64;
-        } else {
-            list_pa = (list_ppn as u64) << PAGE_BITS;
-            list_pa |= (list & ((1 << PAGE_BITS) - 1)) as u64;
         }
+
+        list_pa = (list_ppn as u64) << PAGE_BITS;
+        list_pa |= (list & ((1 << PAGE_BITS) - 1)) as u64;
 
         let raw = ctx.physread_dword(list_pa);
         let entry = LinearFmt(raw);

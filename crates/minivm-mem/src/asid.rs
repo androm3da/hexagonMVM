@@ -111,7 +111,7 @@ impl AsidTable {
     /// Increment the reference count for an ASID entry, or allocate a new one.
     ///
     /// If `invalidate` is true, TLB and STLB entries for this ASID are invalidated.
-    /// Returns the ASID index on success, or -1 on failure.
+    /// Returns the ASID index on success, or `None` if no free slot is available.
     ///
     /// The caller must hold the ASID spinlock and provide callbacks for TLB/STLB
     /// invalidation.
@@ -123,7 +123,7 @@ impl AsidTable {
         extra: u8,
         vmidx: u8,
         mut invalidate_fn: impl FnMut(u32),
-    ) -> i32 {
+    ) -> Option<u32> {
         let ttype = trans_type as u8;
 
         // Check if entry already exists
@@ -136,7 +136,7 @@ impl AsidTable {
             if invalidate {
                 invalidate_fn(idx);
             }
-            return idx as i32;
+            return Some(idx);
         }
 
         // Try to find a free slot via eviction
@@ -149,10 +149,10 @@ impl AsidTable {
                 .with_count(1)
                 .with_extra(extra);
             invalidate_fn(idx);
-            return idx as i32;
+            return Some(idx);
         }
 
-        -1 // No free slot available
+        None // No free slot available
     }
 
     /// Decrement the reference count for an ASID entry.
@@ -220,10 +220,10 @@ mod tests {
         let asid = table.inc(0x1000_0000, TranslationType::Offset, false, 0, 1, |idx| {
             invalidated.push(idx)
         });
-        assert!(asid >= 0);
+        assert!(asid.is_some());
         assert!(!invalidated.is_empty()); // New entries always invalidated
 
-        let entry = table.get(asid as u32);
+        let entry = table.get(asid.unwrap());
         assert_eq!(entry.ptb, 0x1000_0000);
         assert_eq!(entry.fields.count(), 1);
         assert_eq!(entry.fields.vmid(), 1);
@@ -236,16 +236,18 @@ mod tests {
         let asid1 = table.inc(0x2000, TranslationType::Linear, false, 0, 2, |_| {});
         let asid2 = table.inc(0x2000, TranslationType::Linear, false, 0, 2, |_| {});
         assert_eq!(asid1, asid2);
-        assert_eq!(table.get(asid1 as u32).fields.count(), 2);
+        assert_eq!(table.get(asid1.unwrap()).fields.count(), 2);
     }
 
     #[test]
     fn test_dec() {
         let mut table = AsidTable::new();
-        let asid = table.inc(0x3000, TranslationType::Table, false, 0, 3, |_| {});
-        assert_eq!(table.get(asid as u32).fields.count(), 1);
-        table.dec(asid as u32);
-        assert_eq!(table.get(asid as u32).fields.count(), 0);
+        let asid = table
+            .inc(0x3000, TranslationType::Table, false, 0, 3, |_| {})
+            .unwrap();
+        assert_eq!(table.get(asid).fields.count(), 1);
+        table.dec(asid);
+        assert_eq!(table.get(asid).fields.count(), 0);
     }
 
     #[test]
