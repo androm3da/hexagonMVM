@@ -130,9 +130,22 @@ fn parse_fdt(fdt_phys: u64) -> FdtInfo {
     if fdt_phys == 0 {
         return FdtInfo::empty();
     }
-    // Safety: We trust the bootloader/QEMU to pass a valid address.
-    // If the address is garbage, fdt::Fdt::new will fail on the magic check.
-    let slice = unsafe { core::slice::from_raw_parts(fdt_phys as *const u8, MAX_FDT_SIZE) };
+    // Check the header before handing a slice to the parser: the blob is
+    // whatever size the firmware chose (QEMU pads it to 1MB), and the
+    // parser rejects a slice shorter than the header's totalsize.
+    // Safety: we trust the bootloader to pass a readable address; a
+    // garbage pointer fails the magic check below.
+    let (magic, totalsize) = unsafe {
+        (
+            core::ptr::read_volatile(fdt_phys as *const u32),
+            u32::from_be(core::ptr::read_volatile((fdt_phys as u32 + 4) as *const u32)),
+        )
+    };
+    // 0xd00dfeed stored big-endian reads back as 0xedfe0dd0 here.
+    if magic != 0xedfe_0dd0 || totalsize < 40 || totalsize as usize > MAX_FDT_SIZE {
+        return FdtInfo::empty();
+    }
+    let slice = unsafe { core::slice::from_raw_parts(fdt_phys as *const u8, totalsize as usize) };
     let fdt = match fdt::Fdt::new(slice) {
         Ok(fdt) => fdt,
         Err(_) => return FdtInfo::empty(),
@@ -2219,8 +2232,9 @@ fn boot_guest() {
     debug::write0(&buf);
 }
 
-/// Maximum FDT size to scan (64 KiB).
-const MAX_FDT_SIZE: usize = 0x10000;
+/// Largest FDT we will map and parse. The `virt` machine reserves a 4 MiB
+/// window for it and pads the blob itself (QEMU currently emits 1 MiB).
+const MAX_FDT_SIZE: usize = 0x40_0000;
 
 /// Main entry point called from assembly after stack/GP setup.
 ///
