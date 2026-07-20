@@ -27,8 +27,15 @@ pub fn offset_translate(
     let orig_pn = input.pn();
     let offset = OffsetConfig(info.ptb);
 
-    // Apply offset configuration
-    let mut trans = input.with_pn(input.pn().wrapping_add(offset.pages()));
+    // Apply offset configuration.
+    //
+    // `pages` is a 20-bit field (see `H2K_offset_t`), i.e. a modular page
+    // offset over the 32-bit physical space: a guest linked at 0xc0000000
+    // and loaded at 0xa0000000 configures pages = 0xe0000 and relies on
+    // the sum wrapping back into 20 bits. Letting it carry out would
+    // address memory above 4 GiB.
+    const PN_MASK: u32 = (1 << 20) - 1;
+    let mut trans = input.with_pn(input.pn().wrapping_add(offset.pages()) & PN_MASK);
 
     // Clamp page size to offset's maximum
     if trans.size() > offset.size() {
@@ -160,6 +167,18 @@ mod tests {
 
         assert!(!result.is_bad());
         assert_eq!(result.pn(), 1 + 0x100); // original pn + offset
+    }
+
+    #[test]
+    fn test_offset_wraps_within_20_bit_page_number() {
+        // Linux-style boot: linked at 0xc0000000, loaded at 0xa0000000.
+        let ctx = TestCtx::simple(0, 0xFFFFF);
+        let info = make_offset_info(0xE0000, 10, 0xF, 7, true, 0);
+        let input = Translation::default_for_va(0xC000_0000);
+        let result = offset_translate(&ctx, input, info);
+
+        assert!(!result.is_bad());
+        assert_eq!(result.pn(), 0xA0000);
     }
 
     #[test]
