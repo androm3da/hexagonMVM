@@ -352,6 +352,14 @@ unsafe fn flush_guest_tlb() {
     TLB_IDX = RESERVED_TLB_ENTRIES;
 }
 
+/// Physical address of the FDT QEMU passed in r1:r0, or 0 if none.
+///
+/// A valid FDT means we were started as the machine's firmware with a
+/// separately loaded kernel, which selects the Linux-style boot protocol
+/// in `boot_guest`.
+#[cfg(target_arch = "hexagon")]
+static mut BOOT_FDT_ADDR: u32 = 0;
+
 /// Platform description discovered from `cfgbase`/`rev` at boot.
 #[cfg(target_arch = "hexagon")]
 static mut PLATFORM: discovery::Platform = discovery::Platform::empty();
@@ -2119,8 +2127,9 @@ fn do_vmop_boot(pc: u32, sp: u32, arg1: u32, prio: u32, vm_idx: u32) -> u32 {
 
 /// Boot a guest binary via VMOP_BOOT.
 ///
-/// The guest binary must be pre-loaded at `GUEST_ENTRY_VA` (e.g. via
-/// QEMU `-device loader,addr=0xa0000000,file=guest.bin`).
+/// The guest image must be pre-loaded at `GUEST_LOAD_PA`, either by
+/// QEMU's `-device loader` (flat guests) or as the machine's `-kernel`
+/// (Linux boot protocol).
 ///
 /// 1. CONFIG SET_CPUS_INTS → create child VM
 /// 2. CONFIG SET_PMAP_TYPE, SET_FENCES, SET_PRIO_TRAPMASK
@@ -2132,11 +2141,34 @@ fn do_vmop_boot(pc: u32, sp: u32, arg1: u32, prio: u32, vm_idx: u32) -> u32 {
 fn boot_guest() {
     use minivm_types::config::PhysintConfig;
 
-    const GUEST_ENTRY_VA: u32 = 0xa0000000;
+    /// Physical address the machine loads the guest image at.
+    const GUEST_LOAD_PA: u32 = 0xa0000000;
+    /// PAGE_OFFSET of the Hexagon Linux port: a kernel started through
+    /// the firmware boot protocol is linked here and expects the monitor
+    /// to map it onto the physical load address.
+    const LINUX_LINK_VA: u32 = 0xc0000000;
     const GUEST_NUM_VCPU: u32 = 1;
     const TOTAL_INTS: u32 = 288;
     const SHARED_INTS: u32 = TOTAL_INTS + 32;
     const GUEST_VM_PRIO: u32 = 3;
+
+    // Boot protocol selection.
+    //
+    // A valid FDT means QEMU started us as machine firmware and loaded a
+    // separate kernel: that guest follows the Linux boot protocol — it is
+    // linked at PAGE_OFFSET, runs from the physical load address, and
+    // takes the DTB pointer in r0. Without an FDT the guest is a flat
+    // image linked at (and identity-mapped to) the load address, which is
+    // what the guest tests use.
+    let dtb = unsafe { BOOT_FDT_ADDR };
+    let linux_boot = dtb != 0;
+    let guest_entry_va = if linux_boot {
+        LINUX_LINK_VA
+    } else {
+        GUEST_LOAD_PA
+    };
+    // Offset translation adds this page count to every guest page number.
+    let guest_offset_pages = (GUEST_LOAD_PA >> 12).wrapping_sub(guest_entry_va >> 12);
 
     // Enable cycle counters: SSR.CE (bit 23) must be set for
     // upcyclelo/upcyclehi to return non-zero values on QEMU.
@@ -2153,7 +2185,20 @@ fn boot_guest() {
         core::arch::asm!("sgp0 = {val}", val = in(reg) monitor_ptr);
     }
 
+    // Skip guest boot when no image is loaded (RAM reads back as zeros,
+    // which is not a valid packet).
+    let first_word = unsafe { core::ptr::read_volatile(GUEST_LOAD_PA as *const u32) };
+    if first_word == 0 {
+        debug::write0(b"guest: no image at load address, skipping boot\n\0");
+        return;
+    }
+
     debug::write0(b"guest: start boot\n\0");
+    if linux_boot {
+        debug::write0(b"guest: linux boot protocol\n\0");
+        print_hex(b"guest: entry va ", guest_entry_va);
+        print_hex(b"guest: dtb ", dtb);
+    }
 
     // 1. CONFIG SET_CPUS_INTS — allocate child VM
     let vm_idx: u32;
@@ -2173,9 +2218,11 @@ fn boot_guest() {
         return;
     }
 
-    // 2. CONFIG SET_PMAP_TYPE — identity offset translation (pages=0)
-    // SIZE_4M=5, L1WB_L2C=7, URWX=0xF, pages=0
-    let guest_offset = minivm_types::config::OffsetConfig::new(5, 7, false, 0xF, 0);
+    // 2. CONFIG SET_PMAP_TYPE — offset translation mapping the guest's
+    // link address onto the physical load address (identity for flat
+    // guests). SIZE_4M=5, L1WB_L2C=7, URWX=0xF.
+    let guest_offset =
+        minivm_types::config::OffsetConfig::new(5, 7, false, 0xF, guest_offset_pages);
     let pmap_result: u32;
     unsafe {
         core::arch::asm!(
@@ -2252,7 +2299,7 @@ fn boot_guest() {
     }
     debug::write0(b"guest: vm configured\n\0");
 
-    // Guest binary is pre-loaded at GUEST_ENTRY_VA by QEMU's -device loader.
+    // Guest binary is pre-loaded at GUEST_LOAD_PA by QEMU.
 
     // 6. Wire the kernel mapping and turn on the MMU.
     //
@@ -2312,10 +2359,11 @@ fn boot_guest() {
     }
 
     debug::write0(b"guest: booting\n\0");
+    // arg1 lands in the guest's r0: Linux expects the DTB pointer there.
     let boot_result = do_vmop_boot(
-        GUEST_ENTRY_VA,
-        GUEST_ENTRY_VA + 0x100_0000,
-        0,
+        guest_entry_va,
+        guest_entry_va + 0x100_0000,
+        dtb,
         GUEST_VM_PRIO,
         vm_idx,
     );
@@ -2376,6 +2424,9 @@ pub extern "C" fn minivm_main(fdt_phys: u64) -> ! {
     let fdt_info = parse_fdt(fdt_phys);
     if fdt_info.valid {
         debug::write0(b"  [fdt] device tree found\n\0");
+        unsafe {
+            BOOT_FDT_ADDR = fdt_phys as u32;
+        }
     }
 
     // === Subsystem Initialization ===
