@@ -11,7 +11,7 @@ BUILD_DIR := target/guest-tests
 
 # Allow the Rust linker to be overridden via CC (used in CI with a cross clang).
 # When CC is not set, .cargo/config.toml supplies the linker.
-ifdef CC
+ifneq ($(origin CC),default)
 export CARGO_TARGET_HEXAGON_UNKNOWN_NONE_ELF_LINKER := $(CC)
 endif
 
