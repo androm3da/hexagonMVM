@@ -59,7 +59,9 @@ _start:
 	r3:2 = #0xff
 	vmsettime
 	vmgettime
-	{ p0 = cmp.gtu(r1:0, r3:2); if (!p0) jump:nt _fail }
+	/* .new: a non-.new predicate read in the same packet would use the
+	   stale pre-packet p0 value */
+	{ p0 = cmp.gtu(r1:0, r3:2); if (!p0.new) jump:nt _fail }
 
 	// Start a new virtual processor
 	r1 = ##(stack1 + STACK_SIZE - 8)
