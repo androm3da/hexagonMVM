@@ -97,10 +97,33 @@ minivm_context_save:
 	r9:8 = g3:2
 	memd(r7+#256) = r11:10
 	memd(r7+#264) = r9:8
-	r29 = ##__stack_end
+	/* Run handlers on this hthread's dedicated exception stack.
+	   Reusing the interrupted thread's stack (old r29) or the boot
+	   stack (__stack_end) corrupts live monitor frames when monitor
+	   code itself traps (semihosting, CONFIG/VMOP self-calls). */
+	r28 = htid
+	r28 = add(r28, #1)
+	r27 = ##EXC_STACK_SIZE
+	r29 = ##minivm_exc_stacks
+	r29 += mpyi(r28, r27)
 	r28 = ##__global_pointer
 	jumpr r31
 	.size minivm_context_save, . - minivm_context_save
+
+	/* Debug-build Rust handlers can allocate >16K frames (e.g. the
+	   trap0 CONFIG handler), so keep these generous. */
+	.equ EXC_STACK_SIZE, 65536
+	.equ NUM_EXC_STACKS, 8
+
+	.section .bss
+	.p2align 3
+	.globl minivm_exc_stacks
+	.type minivm_exc_stacks, @object
+minivm_exc_stacks:
+	.space EXC_STACK_SIZE * NUM_EXC_STACKS
+	.size minivm_exc_stacks, EXC_STACK_SIZE * NUM_EXC_STACKS
+
+	.section .text, "ax", @progbits
 
 	.globl minivm_context_restore_rte
 	.type minivm_context_restore_rte, @function
