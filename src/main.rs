@@ -226,66 +226,67 @@ fn pte_to_xwru(pte: u32) -> u8 {
 
 /// Walk the guest page table and cache permissions in `GUEST_PERMS`.
 ///
-/// Must be called BEFORE flushing the TLB, while the guest's PT pages are
-/// still mapped (from the guest's recent writes). Runs during `vmnewmap`
-/// trap handling (SSR.EX=1), but the PT pages are in the TLB from the
-/// guest's preceding stores, so `read_volatile` succeeds without causing
-/// a nested TLB miss.
+/// Reads the table with `memw_phys` so the walk cannot itself fault.
 #[cfg(target_arch = "hexagon")]
 unsafe fn cache_guest_pt_perms(pt_base: u32) {
-    // Default: full permissions (passthrough for unmapped regions)
     GUEST_PERMS.fill(0xF);
-    // Skip if no PT or if base address is not 4K-aligned (invalid/test PT)
+    // Skip if there is no table, or the base is not page-aligned (the
+    // guest tests pass a PC-derived pointer that is not a real base).
     if pt_base == 0 || (pt_base & 0xFFF) != 0 {
         return;
     }
-    // Walk all 1024 L1 entries (each covers 4MB = 4 × 1MB sub-regions)
+    let base = pt_base;
     for l1_idx in 0..1024usize {
-        let l1_pte_addr = pt_base.wrapping_add((l1_idx as u32) * 4);
-        let l1_pte = core::ptr::read_volatile(l1_pte_addr as *const u32);
+        let l1_pte = physread_word(base.wrapping_add((l1_idx as u32) * 4));
         let pgsize = l1_pte & 0x7;
         if pgsize == 7 {
-            // Invalid → no permissions for all 4 sub-regions
             for sub in 0..4 {
                 GUEST_PERMS[l1_idx * 4 + sub] = 0;
             }
             continue;
         }
         if pgsize >= 5 {
-            // 4MB+ direct mapping → same perms for all 4 sub-regions
             let xwru = pte_to_xwru(l1_pte);
             for sub in 0..4 {
                 GUEST_PERMS[l1_idx * 4 + sub] = xwru;
             }
         } else {
-            // L1 points to L2 table → read 4 × 1MB entries
             let l2_base = l1_pte & 0xFFFF_FFF0;
             for l2_idx in 0..4usize {
-                let l2_pte_addr = l2_base.wrapping_add((l2_idx as u32) * 4);
-                let l2_pte = core::ptr::read_volatile(l2_pte_addr as *const u32);
-                let l2_pgsize = l2_pte & 0x7;
-                if l2_pgsize == 7 {
-                    GUEST_PERMS[l1_idx * 4 + l2_idx] = 0;
+                let l2_pte = physread_word(l2_base.wrapping_add((l2_idx as u32) * 4));
+                GUEST_PERMS[l1_idx * 4 + l2_idx] = if l2_pte & 0x7 == 7 {
+                    0
                 } else {
-                    GUEST_PERMS[l1_idx * 4 + l2_idx] = pte_to_xwru(l2_pte);
-                }
+                    pte_to_xwru(l2_pte)
+                };
             }
         }
     }
 }
 
 /// Look up cached guest page table permissions for a virtual address.
-///
-/// Returns 0 if the page has no permissions, 0xF if full permissions (or no
-/// guest PT active). Uses the pre-cached `GUEST_PERMS` array populated during
-/// `vmnewmap`, so no guest memory reads are needed during TLB miss handling.
 #[cfg(target_arch = "hexagon")]
 fn guest_pt_lookup(va: u32) -> u8 {
     if unsafe { GUEST_PT_BASE } == 0 {
-        return 0xF; // No guest PT → full permissions
+        return 0xF;
     }
-    // Index by 1MB region: va >> 20
     unsafe { GUEST_PERMS[(va >> 20) as usize] }
+}
+
+/// Read a word of physical memory without going through the TLB.
+#[cfg(target_arch = "hexagon")]
+fn physread_word(pa: u32) -> u32 {
+    let upper = pa >> 11;
+    let lower = pa & 0x7fc;
+    let val: u32;
+    unsafe {
+        core::arch::asm!(
+            "{v} = memw_phys({l},{u})",
+            v = out(reg) val, l = in(reg) lower, u = in(reg) upper,
+            options(nostack)
+        );
+    }
+    val
 }
 
 /// Static pointer to KernelGlobals for handler access from assembly-called functions.
@@ -464,8 +465,28 @@ impl<'a> minivm_mem::translate::TranslateCtx for KernelTranslateCtx<'a> {
         let size = self.kg.vtcm_size >> 12;
         (base, size)
     }
-    fn physread_dword(&self, _pa: u64) -> u64 {
-        0 // Not needed for offset translation
+    fn physread_dword(&self, pa: u64) -> u64 {
+        // Page-table walks run inside the TLB miss handler, so they must
+        // not themselves fault. `memw_phys` reads physical memory without
+        // consulting the TLB (h2 uses the same primitive in
+        // `kernel/mem/physread/physread.h`).
+        let upper = (pa >> 11) as u32;
+        let lower = (pa & 0x7fc) as u32;
+        let lo: u32;
+        let hi: u32;
+        unsafe {
+            core::arch::asm!(
+                "{v} = memw_phys({l},{u})",
+                v = out(reg) lo, l = in(reg) lower, u = in(reg) upper,
+                options(nostack)
+            );
+            core::arch::asm!(
+                "{v} = memw_phys({l},{u})",
+                v = out(reg) hi, l = in(reg) lower + 4, u = in(reg) upper,
+                options(nostack)
+            );
+        }
+        (lo as u64) | ((hi as u64) << 32)
     }
 }
 
@@ -614,9 +635,8 @@ pub extern "C" fn minivm_guest_trap1_handler(ctx_ptr: *mut ThreadContext, trap_n
                 set_r0(ctx, 0);
             }
             VmTrap::NewMap => {
-                // Store guest page table base and cache permissions.
-                // Cache BEFORE flushing TLB — the guest just wrote the PT
-                // entries, so those pages are in the TLB right now.
+                // Record the guest page table and cache its permissions.
+                // The walk uses physical reads, so it is safe here.
                 let pt_base = ctx_r0(ctx);
                 unsafe {
                     GUEST_PT_BASE = pt_base;
@@ -1042,6 +1062,11 @@ pub extern "C" fn minivm_tlb_miss_handler(ctx_ptr: *mut ThreadContext, va: u32) 
             return;
         }
         result = result.with_xwru(result.xwru() & guest_xwru);
+        // The cache has 1M granularity, so a larger hardware page would
+        // smear one region's permissions across its neighbours.
+        if result.size() > 4 {
+            result = result.with_size(4);
+        }
     }
 
     // Format as TLB entry
