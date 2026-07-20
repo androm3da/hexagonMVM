@@ -31,7 +31,7 @@ minivm-with-tests:
 
 on-target-tests: minivm-with-tests
 	@echo "  ON-TARGET TESTS"
-	timeout 60 $(QEMU) -M virt -nographic \
+	timeout 60 $(QEMU) -M virt -bios none -nographic \
 		-kernel target/hexagon-unknown-none-elf/debug/minivm
 
 $(BUILD_DIR):
@@ -48,7 +48,7 @@ $(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf
 # then check output for PASS.
 $(BUILD_DIR)/%.pass: $(BUILD_DIR)/%.bin $(MINIVM)
 	@echo "  TEST $*"
-	@timeout 30 $(QEMU) -M virt -nographic \
+	@timeout 30 $(QEMU) -M virt -bios none -nographic \
 		-kernel $(MINIVM) \
 		-device "loader,addr=0xa0000000,file=$<" \
 		> $(BUILD_DIR)/$*.log 2>&1; \
@@ -63,7 +63,7 @@ $(BUILD_DIR)/%.pass: $(BUILD_DIR)/%.bin $(MINIVM)
 ZEPHYR_BIN ?= tests_bin/zephyr.bin
 
 zephyr-boot: minivm
-	timeout 30 $(QEMU) -M virt -nographic -m 4G \
+	timeout 30 $(QEMU) -M virt -bios none -nographic -m 4G \
 		-kernel $(MINIVM) \
 		-device "loader,addr=0xa0000000,file=$(ZEPHYR_BIN)"
 
