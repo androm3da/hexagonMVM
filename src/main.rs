@@ -20,7 +20,6 @@ use buddy_system_allocator::LockedHeap;
 
 mod debug;
 #[cfg(target_arch = "hexagon")]
-mod hexagon_abi;
 mod panic;
 mod semihosting;
 #[cfg(feature = "run-tests")]
