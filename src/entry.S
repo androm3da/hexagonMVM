@@ -80,7 +80,9 @@ _start:
 	r0 = sgp0
 	r8 = memw(r0+#80)
 	r1 = memw(r0+#128)
-	p0 = tstbit(r8, #19)
+	/* UM=1 means guest context (guest kernel UM+GM, or user UM only);
+	   the monitor itself runs with UM=0. */
+	p0 = tstbit(r8, #16)
 	if (p0) jump .Ltrap1_guest_dispatch
 	r0 = r1
 	call minivm_trap1_handler

@@ -93,6 +93,14 @@ impl Ssr {
             Self(self.0 & !(1 << Self::GUEST_BIT))
         }
     }
+
+    pub const fn with_um(self, um: bool) -> Self {
+        if um {
+            Self(self.0 | (1 << Self::UM_BIT))
+        } else {
+            Self(self.0 & !(1 << Self::UM_BIT))
+        }
+    }
 }
 
 /// CCR (Cache Control Register) bitfield accessors.
@@ -215,8 +223,10 @@ impl Syscfg {
 pub mod boot_defaults {
     /// Default USR for boot thread (v65+).
     pub const THREAD_USR: u32 = 0x00057c00;
-    /// Default SSR for boot thread (guest bit set).
-    pub const THREAD_SSR: u32 = 0x01c60000 | (1 << super::Ssr::GUEST_BIT);
+    /// Default SSR for boot thread. Guest kernel mode is UM=1 + GM=1 in
+    /// the hardware mode encoding (user mode is UM=1 + GM=0).
+    pub const THREAD_SSR: u32 =
+        0x01c60000 | (1 << super::Ssr::GUEST_BIT) | (1 << super::Ssr::UM_BIT);
     /// Default CCR for boot thread.
     pub const THREAD_CCR: u32 = 0x00170000;
     /// Default GPUGP for boot thread (UGP = 0).

@@ -18,9 +18,10 @@ pub fn run() {
     // Set up a guest context with SSR.GUEST=1
     let mut guest_ctx = ThreadContext::zeroed();
     guest_ctx.elr = super::guest_entries::guest_test_entry as *const () as u32;
-    // SSR with GUEST bit set (bit 19).
-    // Also set ASID=0 and clear other bits.
-    guest_ctx.ssr = 1 << 19; // SSR_GUEST_BIT
+    // Guest kernel mode is UM=1 (bit 16) + GM=1 (bit 19) in the hardware
+    // mode encoding. EX=1 (bit 17) keeps the restore path privileged
+    // until rte. ASID=0.
+    guest_ctx.ssr = (1 << 19) | (1 << 17) | (1 << 16);
 
     // Set up stack and GP on the alternate stack
     let alt_sp = unsafe { core::ptr::addr_of!(ALT_STACK).cast::<u8>().add(4096) as u32 };

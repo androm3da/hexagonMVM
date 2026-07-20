@@ -188,16 +188,17 @@ use ctx_ops::*;
 
 /// Apply a VM event result to the thread context.
 ///
-/// Handles user→supervisor mode transition when the event was delivered
+/// Handles user→guest-kernel mode transition when the event was delivered
 /// from user mode: saves user r29 to GOSP, restores kernel stack from
-/// old GOSP, and clears SSR.UM.
+/// old GOSP, and sets SSR.GM (guest kernel is UM=1+GM=1; user is
+/// UM=1+GM=0).
 #[cfg(target_arch = "hexagon")]
 fn apply_vm_event(ctx: &mut ThreadContext, ev: vmevent::VmEventResult) {
     if ev.was_user_mode {
         let old_gosp = ctx.gosp;
         ctx.gosp = ev.gosp; // Save user r29 → GOSP
         set_r29(ctx, old_gosp); // Set r29 = old GOSP (kernel stack)
-        ctx.ssr &= !(1 << Ssr::UM_BIT); // Clear UM for supervisor mode
+        ctx.ssr |= 1 << Ssr::GUEST_BIT; // Enter guest kernel mode
     }
     ctx.gelr = ev.gelr;
     ctx.gssr = ev.gssr;
@@ -513,14 +514,18 @@ pub extern "C" fn minivm_guest_trap1_handler(ctx_ptr: *mut ThreadContext, trap_n
                 }
                 let gssr = ctx.gssr;
                 ctx.elr = ctx.gelr;
-                // If was in user mode, swap r29 and GOSP
+                // Hardware mode encoding: guest kernel is UM=1+GM=1,
+                // guest user is UM=1+GM=0 (GM cleared so the hardware
+                // enforces the TLB U bit).
                 if gssr & GSSR_UM != 0 {
                     let r29 = ctx_r29(ctx);
                     set_r29(ctx, ctx.gosp);
                     ctx.gosp = r29;
-                    ctx.ssr |= 1 << Ssr::UM_BIT; // Enter user mode
+                    ctx.ssr |= 1 << Ssr::UM_BIT;
+                    ctx.ssr &= !(1 << Ssr::GUEST_BIT); // Enter user mode
                 } else {
-                    ctx.ssr &= !(1 << Ssr::UM_BIT); // Back to supervisor
+                    // Back to guest kernel mode
+                    ctx.ssr |= (1 << Ssr::UM_BIT) | (1 << Ssr::GUEST_BIT);
                 }
                 // Restore IE from GSSR
                 if gssr & GSSR_IE != 0 {
@@ -711,7 +716,7 @@ pub extern "C" fn minivm_guest_trap1_handler(ctx_ptr: *mut ThreadContext, trap_n
                     ctx.gevb,
                     ctx.elr,
                     ctx_r29(ctx),
-                    !Ssr::new(ctx.ssr).um(), // user mode awareness
+                    Ssr::new(ctx.ssr).guest(), // false = user mode (UM=1,GM=0)
                     ie_enabled(ctx),
                     false, // no single-step
                 );
@@ -859,7 +864,7 @@ fn deliver_interrupt_event(ctx: &mut ThreadContext, intno: u32) {
         ctx.gevb,
         ctx.elr,
         ctx_r29(ctx),
-        !Ssr::new(ctx.ssr).um(), // user mode → ssr_guest=false for r29/GOSP swap
+        Ssr::new(ctx.ssr).guest(), // false = user mode (UM=1,GM=0)
         ie_enabled(ctx),
         false, // ss_enabled
     );
@@ -955,7 +960,7 @@ pub extern "C" fn minivm_tlb_miss_handler(ctx_ptr: *mut ThreadContext, va: u32) 
     if unsafe { GUEST_PT_BASE } != 0 {
         let guest_xwru = guest_pt_lookup(va);
         let ssr_cause = ssr.cause();
-        let is_user = ssr.um();
+        let is_user = ssr.um() && !ssr.guest();
 
         let violation_cause = match ssr_cause {
             // Instruction fetch
@@ -1055,7 +1060,7 @@ fn handle_pagefault_cause(ctx: &mut ThreadContext, va: u32, cause: u32) {
             ctx.gevb,
             ctx.elr,
             ctx_r29(ctx),
-            !Ssr::new(ctx.ssr).um(), // user mode → ssr_guest=false
+            Ssr::new(ctx.ssr).guest(), // false = user mode (UM=1,GM=0)
             ie_enabled(ctx),
             false, // no single-step
         );
@@ -1099,7 +1104,7 @@ pub extern "C" fn minivm_error_handler(ctx_ptr: *mut ThreadContext, badva: u32, 
         ERROR_COUNT = ERROR_COUNT.saturating_add(1);
     }
 
-    if ssr.guest() {
+    if ssr.um() {
         // Deliver error to guest's GEVB error handler.
         // Only deliver first batch of errors to prevent recursive exception loops.
         let first_error = unsafe { ERROR_COUNT <= 100 };
@@ -1111,7 +1116,7 @@ pub extern "C" fn minivm_error_handler(ctx_ptr: *mut ThreadContext, badva: u32, 
                 ctx.gevb,
                 ctx.elr,
                 ctx_r29(ctx),
-                !ssr.um(), // user mode → ssr_guest=false for r29/GOSP swap
+                ssr.guest(), // false = user mode (UM=1,GM=0)
                 ie_enabled(ctx),
                 false, // no single-step
             );
@@ -1151,8 +1156,9 @@ pub extern "C" fn minivm_trap0_semihost_handler(ctx_ptr: *mut ThreadContext) {
     let ctx = unsafe { &mut *ctx_ptr };
     let ssr = Ssr::new(ctx.ssr);
 
-    // Only handle guest-mode trap0s
-    if !ssr.guest() {
+    // Only handle guest-mode trap0s (guest kernel or guest user; the
+    // monitor itself has UM=0)
+    if !ssr.um() {
         return;
     }
 
@@ -1173,7 +1179,7 @@ pub extern "C" fn minivm_trap0_semihost_handler(ctx_ptr: *mut ThreadContext) {
             ctx.gevb,
             ctx.elr,
             ctx_r29(ctx),
-            !ssr.um(), // user mode → ssr_guest=false
+            ssr.guest(), // false = user mode (UM=1,GM=0)
             ie_enabled(ctx),
             false,
         );
@@ -1359,8 +1365,11 @@ pub extern "C" fn minivm_trap0_vmop_handler(ctx_ptr: *mut ThreadContext) -> u32 
             guest_ctx.r2928 = (sp as u64) << 32; // r29=sp, r28=0
                                                  // r0100 will be set by the assembly (memw(r7+#128) = r0)
                                                  // after this handler returns arg1.
-            guest_ctx.ssr = Ssr::new(0)
+            // EX=1 keeps the CPU in monitor mode while context_restore
+            // writes system registers; rte clears it on guest entry.
+            guest_ctx.ssr = Ssr::new(1 << Ssr::EX_BIT)
                 .with_guest(true)
+                .with_um(true) // guest kernel mode = UM=1 + GM=1
                 .with_asid(asid as u8)
                 .with_ie(true) // Enable hardware interrupts (host IE) during guest execution
                 .0;
@@ -1938,11 +1947,14 @@ pub(crate) fn vmboot(
     };
     guest_ctx.r0100 = arg1 as u64;
 
-    // SSR: GUEST=1, ASID=allocated
-    // Note: UM bit is NOT set here. On real hardware, the first guest thread
-    // starts in supervisor mode within the guest. Linux quickly sets up its
-    // own exception vectors and enters user mode itself.
-    let ssr = Ssr::new(0).with_guest(true).with_asid(asid as u8);
+    // SSR: guest kernel mode (UM=1 + GM=1), ASID=allocated. The guest
+    // enters user mode (UM=1 + GM=0) itself via vmrte with GSR.UM set.
+    // EX=1 keeps the CPU in monitor mode during context restore; rte
+    // clears it on guest entry.
+    let ssr = Ssr::new(1 << Ssr::EX_BIT)
+        .with_guest(true)
+        .with_um(true)
+        .with_asid(asid as u8);
     guest_ctx.ssr = ssr.0;
 
     // CCR from boot defaults

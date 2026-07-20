@@ -39,7 +39,8 @@ pub fn run(kg: &KernelGlobals) {
     // Set up guest context
     let mut guest_ctx = ThreadContext::zeroed();
     guest_ctx.elr = super::guest_entries::bootvm_guest_test as *const () as u32;
-    guest_ctx.ssr = 1 << 19; // SSR.GUEST = 1
+    // Guest kernel mode = UM(16) + GM(19); EX(17) for the restore path.
+    guest_ctx.ssr = (1 << 19) | (1 << 17) | (1 << 16);
 
     // Set up stack and GP
     let alt_sp = unsafe { core::ptr::addr_of!(ALT_STACK).cast::<u8>().add(4096) as u32 };
