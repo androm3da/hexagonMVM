@@ -12,6 +12,7 @@
 
 pub mod linear;
 pub mod offset;
+pub mod table;
 
 use minivm_types::asid::{AsidEntry, TranslationType};
 use minivm_types::translate::Translation;
@@ -72,6 +73,7 @@ pub fn translate(ctx: &dyn TranslateCtx, input: Translation, info: AsidEntry) ->
     match TranslationType::from_raw(info.trans_type()) {
         Some(TranslationType::Offset) => offset::offset_translate(ctx, input, info),
         Some(TranslationType::Linear) => linear::linear_translate(ctx, input, info),
+        Some(TranslationType::Table) => table::table_translate(ctx, input, info),
         _ => Translation::BAD,
     }
 }
