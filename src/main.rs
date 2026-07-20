@@ -19,6 +19,7 @@ extern crate alloc;
 use buddy_system_allocator::LockedHeap;
 
 mod debug;
+mod discovery;
 #[cfg(target_arch = "hexagon")]
 mod panic;
 mod semihosting;
@@ -350,6 +351,10 @@ unsafe fn flush_guest_tlb() {
     }
     TLB_IDX = RESERVED_TLB_ENTRIES;
 }
+
+/// Platform description discovered from `cfgbase`/`rev` at boot.
+#[cfg(target_arch = "hexagon")]
+static mut PLATFORM: discovery::Platform = discovery::Platform::empty();
 
 /// Global mutable ASID table pointer (for CONFIG/VMOP handlers that need to allocate ASIDs).
 #[cfg(target_arch = "hexagon")]
@@ -2348,7 +2353,26 @@ pub extern "C" fn minivm_main(fdt_phys: u64) -> ! {
     debug::init();
     debug::write0(b"minivm: Hexagon VM (Rust)\n\0");
 
-    // === FDT Discovery ===
+    // === Platform Discovery ===
+    // Devices come from the config table ROM pointed to by `cfgbase`, and
+    // architectural features from `rev`; the FDT supplies the rest.
+    let plat = discovery::discover();
+    unsafe {
+        PLATFORM = plat;
+    }
+    if plat.cfg_base != 0 {
+        print_hex(b"  [cfg] config table at ", plat.cfg_base);
+        print_hex(b"  [cfg] subsystem base ", plat.ss_base);
+        print_hex(b"  [cfg] l2vic base ", plat.l2vic_base);
+        print_hex(b"  [cfg] qtimer base ", plat.qtimer_base);
+        print_hex(b"  [cfg] jtlb entries ", plat.jtlb_entries);
+    }
+    print_hex(b"  [rev] core revision ", plat.rev);
+    match plat.arch {
+        Some(a) => print_hex(b"  [rev] arch version ", a as u32),
+        None => debug::write0(b"  [rev] arch version unknown\n\0"),
+    }
+
     let fdt_info = parse_fdt(fdt_phys);
     if fdt_info.valid {
         debug::write0(b"  [fdt] device tree found\n\0");
