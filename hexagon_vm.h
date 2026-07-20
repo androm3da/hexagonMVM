@@ -15,6 +15,11 @@
 #define vmgetie   trap1(#4)
 #define vmintop   trap1(#5)
 #define vmclrmap  trap1(#10)
+/* Translation types for vmnewmap's r1 argument */
+#define HVM_TRANS_TYPE_LINEAR 0
+#define HVM_TRANS_TYPE_TABLE  1
+#define HVM_TRANS_TYPE_OFFSET 2
+
 #define vmnewmap  trap1(#11)
 #define vmcache   trap1(#13)
 #define vmgettime trap1(#14)

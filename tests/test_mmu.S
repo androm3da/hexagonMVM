@@ -78,6 +78,7 @@ _start:
 	memw(r0) = r1
 
 	r0 = r24
+	r1 = #HVM_TRANS_TYPE_TABLE
 	vmnewmap
 
 	// Install our event vectors
@@ -140,6 +141,7 @@ GUEST_event_abort:
 	r1 = or(r1, #(USER_WR_PTE_BITS | HVM_PTE_PGSIZE_1M))
 	memw(r0) = r1
 	r0 = ##guest_pt
+	r1 = #HVM_TRANS_TYPE_TABLE
 	vmnewmap
 	r0 = #1
 	memw(##caught_page_fault_exception) = r0
@@ -155,6 +157,7 @@ GUEST_event_abort:
 	// Fix the page table entry
 	CREATE_PTE_ENTRIES(_user_text, _end_user_text, USER_XWR_PTE_BITS)
 	r0 = ##guest_pt
+	r1 = #HVM_TRANS_TYPE_TABLE
 	vmnewmap
 	r0 = #1
 	memw(##caught_nouser_exception) = r0

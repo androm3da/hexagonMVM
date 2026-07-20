@@ -49,6 +49,7 @@ _start:
 	CREATE_PTE_ENTRIES(_start, _end_guest, GUEST_PTE_BITS)
 
 	r0 = r24
+	r1 = #HVM_TRANS_TYPE_TABLE
 	vmnewmap
 
 	// Install our event vectors
