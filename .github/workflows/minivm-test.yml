@@ -19,6 +19,14 @@ jobs:
             sudo apt update
             sudo apt install make gcc qemu wget
             sudo apt build-dep -yy qemu
+      - name: Work around missing libbrlapi.so.0.7 on ubuntu-22.04
+        run: |
+            # The toolchain-bundled qemu-system-hexagon was linked against
+            # libbrlapi.so.0.7, but ubuntu-22.04 only ships .so.0.8. brlapi
+            # is a braille-accessibility library that qemu links but never
+            # calls in a headless run, so the ABI-compatible symlink is safe.
+            lib=$(dpkg -L libbrlapi0.8 | grep -m1 'libbrlapi\.so\.0\.8\.[0-9]*$')
+            sudo ln -sf "${lib}" "$(dirname "${lib}")/libbrlapi.so.0.7"
       - name: Set PATH
         run: echo "PATH=${PATH}:/usr/local/bin:/opt/clang+llvm-19.1.2-cross-hexagon-unknown-linux-musl/x86_64-linux-gnu/bin" >> ${GITHUB_ENV}
       - name: Download, Unpack Toolchain
@@ -31,6 +39,8 @@ jobs:
             tar xf /tmp/clang+llvm-19.1.2-cross-hexagon-unknown-linux-musl.tar.xz
       - name: build
         run: make minivm CC=hexagon-unknown-none-elf-clang
+      - name: test
+        run: make on-target-tests CC=hexagon-unknown-none-elf-clang
 
   miri:
     runs-on: ubuntu-22.04
