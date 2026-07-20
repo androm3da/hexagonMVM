@@ -14,14 +14,15 @@ pub fn run() {
         let mut inv_count: u32 = 0;
 
         // Allocate a new ASID entry
-        let asid = table.inc(0x1000_0000, TranslationType::Offset, false, 0, 1, |_| {
-            inv_count += 1
-        });
-        assert!(asid >= 0);
+        let asid = table
+            .inc(0x1000_0000, TranslationType::Offset, false, 0, 1, |_| {
+                inv_count += 1
+            })
+            .unwrap();
         assert_eq!(inv_count, 1); // new entry always invalidates
 
         // Verify entry fields
-        let entry = table.get(asid as u32);
+        let entry = table.get(asid);
         assert_eq!(entry.ptb, 0x1000_0000);
         assert_eq!(entry.fields.count(), 1);
         assert_eq!(entry.fields.vmid(), 1);
@@ -29,7 +30,7 @@ pub fn run() {
 
         // Search should find it
         let found = table.search(0x1000_0000, 1, TranslationType::Offset as u8);
-        assert_eq!(found, Some(asid as u32));
+        assert_eq!(found, Some(asid));
 
         // Search with wrong type should not find it
         assert!(table
@@ -38,11 +39,13 @@ pub fn run() {
 
         // Re-inc same entry: count increments, same ASID
         inv_count = 0;
-        let asid2 = table.inc(0x1000_0000, TranslationType::Offset, false, 0, 1, |_| {
-            inv_count += 1
-        });
+        let asid2 = table
+            .inc(0x1000_0000, TranslationType::Offset, false, 0, 1, |_| {
+                inv_count += 1
+            })
+            .unwrap();
         assert_eq!(asid, asid2);
-        assert_eq!(table.get(asid as u32).fields.count(), 2);
+        assert_eq!(table.get(asid).fields.count(), 2);
         assert_eq!(inv_count, 0); // not invalidated (flag=False)
 
         // Re-inc with invalidate=True
@@ -53,25 +56,26 @@ pub fn run() {
         assert_eq!(inv_count, 1); // invalidated
 
         // Decrement
-        table.dec(asid as u32);
-        assert_eq!(table.get(asid as u32).fields.count(), 2);
-        table.dec(asid as u32);
-        assert_eq!(table.get(asid as u32).fields.count(), 1);
-        table.dec(asid as u32);
-        assert_eq!(table.get(asid as u32).fields.count(), 0);
+        table.dec(asid);
+        assert_eq!(table.get(asid).fields.count(), 2);
+        table.dec(asid);
+        assert_eq!(table.get(asid).fields.count(), 1);
+        table.dec(asid);
+        assert_eq!(table.get(asid).fields.count(), 0);
 
         // After count=0, search should fail (entry is evictable)
         // Actually it still matches - the entry is there, just with count 0.
         // The search still finds it because ptb/vmid/type match.
 
         // Allocate a different entry
-        let asid3 = table.inc(0x2000_0000, TranslationType::Linear, false, 0, 2, |_| {});
-        assert!(asid3 >= 0);
+        let asid3 = table
+            .inc(0x2000_0000, TranslationType::Linear, false, 0, 2, |_| {})
+            .unwrap();
         assert_eq!(
-            table.get(asid3 as u32).fields.trans_type(),
+            table.get(asid3).fields.trans_type(),
             TranslationType::Linear as u8
         );
-        assert_eq!(table.get(asid3 as u32).fields.vmid(), 2);
+        assert_eq!(table.get(asid3).fields.vmid(), 2);
     }
     debug::write0(b"  [test] ASID table ops OK\n\0");
 }

@@ -19,9 +19,10 @@ pub fn run() {
 
         // Allocate ASID with 0-page offset, max size=10, all perms, L1WB_L2C
         let offset = OffsetConfig::new(10, 7, true, 0xF, 0);
-        let asid = test_asid.inc(offset.0, TranslationType::Offset, false, 0, 1, |_| {});
-        assert!(asid >= 0);
-        let info = *test_asid.get(asid as u32);
+        let asid = test_asid
+            .inc(offset.0, TranslationType::Offset, false, 0, 1, |_| {})
+            .unwrap();
+        let info = *test_asid.get(asid);
         assert!(!info.is_empty());
 
         // Set up VM with fences for translation context
@@ -63,18 +64,20 @@ pub fn run() {
         assert_eq!(result.pn(), va >> 12); // identity: PA == VA
 
         // Test 2: Format as TLB entry and verify fields
-        let entry = minivm_mem::tlb_fill::tlbfmt_from_translation(result, va, asid as u32);
+        let entry = minivm_mem::tlb_fill::tlbfmt_from_translation(result, va, asid);
         assert_ne!(entry, 0);
         let hi = (entry >> 32) as u32;
         assert_eq!(hi & 0x000F_FFFF, va >> 12); // VPN
-        assert_eq!((hi >> 20) & 0x7F, asid as u32); // ASID
+        assert_eq!((hi >> 20) & 0x7F, asid); // ASID
         assert_eq!(hi >> 31, 1); // valid
         assert_eq!(((entry as u32) >> 28) & 0xF, 0xF); // all perms
 
         // Test 3: Offset translation (0x100 pages offset)
         let offset2 = OffsetConfig::new(10, 7, true, 0xF, 0x100);
-        let asid2 = test_asid.inc(offset2.0, TranslationType::Offset, false, 0, 1, |_| {});
-        let info2 = *test_asid.get(asid2 as u32);
+        let asid2 = test_asid
+            .inc(offset2.0, TranslationType::Offset, false, 0, 1, |_| {})
+            .unwrap();
+        let info2 = *test_asid.get(asid2);
         let va2 = 0x1000u32; // page 1
         let result2 =
             minivm_mem::translate::translate(&tctx, Translation::default_for_va(va2), info2);
@@ -87,8 +90,10 @@ pub fn run() {
         let tctx2 = TCtx { vm: &tight_vm };
         // Use size=0 (4K) so page_span=1
         let offset3 = OffsetConfig::new(0, 7, true, 0xF, 0);
-        let asid3 = test_asid.inc(offset3.0, TranslationType::Offset, false, 0, 2, |_| {});
-        let info3 = *test_asid.get(asid3 as u32);
+        let asid3 = test_asid
+            .inc(offset3.0, TranslationType::Offset, false, 0, 2, |_| {})
+            .unwrap();
+        let info3 = *test_asid.get(asid3);
         // VA page 0x200 > fence_hi=0x100: should fail
         let bad_result = minivm_mem::translate::translate(
             &tctx2,
@@ -131,7 +136,7 @@ pub fn run() {
             tctx: TCtx { vm: &tlb_vm },
             inserted: 0,
         };
-        minivm_mem::tlb_fill::tlb_fill(&mut fill_ctx, 0x2000_0000, asid as u32);
+        minivm_mem::tlb_fill::tlb_fill(&mut fill_ctx, 0x2000_0000, asid);
         assert_ne!(fill_ctx.inserted, 0);
     }
     debug::write0(b"  [test] TLB fill pipeline OK\n\0");
