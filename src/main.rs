@@ -300,9 +300,55 @@ pub(crate) static mut BOOT_CPUINT: CpuIntState = CpuIntState::new();
 #[cfg(target_arch = "hexagon")]
 pub(crate) static mut ASID_TABLE_PTR: *const AsidTable = core::ptr::null();
 
+/// Hardware TLB indexes below this belong to the monitor: index 0 is the
+/// wired kernel mapping and `MON_TLB_BASE..RESERVED_TLB_ENTRIES` is the
+/// window `.Ltlbmiss_monitor` (entry.S) fills for monitor-mode faults.
+/// The guest round-robin filler never allocates below this line.
+#[cfg(target_arch = "hexagon")]
+const RESERVED_TLB_ENTRIES: u32 = 16;
+
+/// First index of the monitor fault window; must match `MON_TLB_BASE`
+/// in entry.S.
+#[cfg(target_arch = "hexagon")]
+const MON_TLB_BASE: u32 = 8;
+
 /// Global TLB index counter for round-robin TLB slot allocation.
 #[cfg(target_arch = "hexagon")]
-static mut TLB_IDX: u32 = 0;
+static mut TLB_IDX: u32 = RESERVED_TLB_ENTRIES;
+
+/// Build a raw hardware TLB entry (sentinel-PPD format).
+///
+/// `size_type` is the Hexagon page-size code (0=4K … 6=16M); `va`/`pa` must
+/// be naturally aligned for that size. `xwru` is the X/W/R/U permission
+/// nibble (X=bit3 … U=bit0 of the nibble as stored at entry bits 31..28).
+#[cfg(target_arch = "hexagon")]
+fn make_tlb_entry(va: u32, pa: u32, size_type: u32, asid: u32, xwru: u32, cccc: u32, global: bool) -> u64 {
+    let vpn = va >> 12;
+    let ppn = (pa >> 12) & (!0u32 << (2 * size_type));
+    let ppd = (ppn << 1) | (1u32 << size_type);
+    let lo = (ppd & 0x00FF_FFFF) | ((cccc & 0xF) << 24) | ((xwru & 0xF) << 28);
+    let mut hi = (vpn & 0x000F_FFFF) | ((asid & 0x7F) << 20) | (1u32 << 31);
+    if global {
+        hi |= 1 << 30;
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Drop every TLB entry a guest could have installed, keeping the wired
+/// kernel entry and clearing the monitor window (whose global entries may
+/// cover guest addresses after a page-table walk).
+#[cfg(target_arch = "hexagon")]
+unsafe fn flush_guest_tlb() {
+    extern "C" {
+        fn minivm_tlb_insert(entry: u64, index: u32);
+    }
+    let tlb_size = (*KG_PTR).tlb_size;
+    let tlb_size = if tlb_size > 0 { tlb_size } else { 128 };
+    for i in MON_TLB_BASE..tlb_size {
+        minivm_tlb_insert(0, i);
+    }
+    TLB_IDX = RESERVED_TLB_ENTRIES;
+}
 
 /// Global mutable ASID table pointer (for CONFIG/VMOP handlers that need to allocate ASIDs).
 #[cfg(target_arch = "hexagon")]
@@ -575,14 +621,7 @@ pub extern "C" fn minivm_guest_trap1_handler(ctx_ptr: *mut ThreadContext, trap_n
                 unsafe {
                     GUEST_PT_BASE = pt_base;
                     cache_guest_pt_perms(pt_base);
-                    // Flush TLB to clear stale permission entries
-                    extern "C" {
-                        fn minivm_tlb_insert(entry: u64, index: u32);
-                    }
-                    for i in 0..128u32 {
-                        minivm_tlb_insert(0, i);
-                    }
-                    TLB_IDX = 0;
+                    flush_guest_tlb();
                 }
                 set_r0(ctx, 0);
             }
@@ -927,6 +966,9 @@ pub extern "C" fn minivm_tlb_miss_handler(ctx_ptr: *mut ThreadContext, va: u32) 
         TLB_MISS_COUNT += 1;
     }
 
+    // Monitor-mode misses never reach here — entry.S handles them in the
+    // monitor TLB window without touching this (guest-owned) context.
+
     // Look up ASID table
     let asid_table = unsafe { &*ASID_TABLE_PTR };
     let info = *asid_table.get(asid);
@@ -1009,11 +1051,17 @@ pub extern "C" fn minivm_tlb_miss_handler(ctx_ptr: *mut ThreadContext, va: u32) 
         return;
     }
 
-    // Insert into hardware TLB with round-robin index
+    // Insert into hardware TLB with round-robin index, skipping the
+    // wired kernel entries.
     let idx = unsafe {
         let i = TLB_IDX;
         let tlb_size = (*KG_PTR).tlb_size;
-        TLB_IDX = (i + 1) % if tlb_size > 0 { tlb_size } else { 128 };
+        let tlb_size = if tlb_size > 0 { tlb_size } else { 128 };
+        TLB_IDX = if i + 1 >= tlb_size {
+            RESERVED_TLB_ENTRIES
+        } else {
+            i + 1
+        };
         i
     };
     extern "C" {
@@ -2176,19 +2224,37 @@ fn boot_guest() {
 
     // Guest binary is pre-loaded at GUEST_ENTRY_VA by QEMU's -device loader.
 
-    // 6. Set up SYSCFG — enable DMT (bit 15), clear BQ (bit 13).
-    // The C loadlinux does this before minivm_vmboot. DMT (Dual Memory Translation)
-    // is needed for proper TLB operation in guest mode.
+    // 6. Wire the kernel mapping and turn on the MMU.
+    //
+    // A global 16M identity entry at reserved index 0 covers the whole
+    // kernel image (linked at 0xff000000, 8M region) plus the exception
+    // vectors, so monitor code always translates. U=0 keeps it
+    // inaccessible to guest/user mode. Everything else is filled on
+    // demand by the TLB miss handler.
+    unsafe {
+        extern "C" {
+            fn minivm_tlb_insert(entry: u64, index: u32);
+        }
+        let kernel_entry = make_tlb_entry(0xFF00_0000, 0xFF00_0000, 6, 0, 0xE, 0x7, true);
+        minivm_tlb_insert(kernel_entry, 0);
+    }
+
+    // Set up SYSCFG — enable the MMU (bit 0), GIE (bit 4), DMT (bit 15),
+    // clear BQ (bit 13). The C loadlinux does this before minivm_vmboot.
+    // DMT (Dual Memory Translation) is needed for proper TLB operation in
+    // guest mode.
     let syscfg_before: u32;
     let syscfg_after: u32;
     unsafe {
         core::arch::asm!("{val} = syscfg", val = out(reg) syscfg_before);
         let mut val = syscfg_before;
-        val |= 1 << 4; // G: guest mode enable
+        val |= 1 << 0; // MMUEN: enable translation
+        val |= 1 << 4; // GIE: global interrupt enable
         val |= 1 << 15; // DMT: dual memory translation
         val &= !(1u32 << 13); // clear BQ
         core::arch::asm!("syscfg = {v}", v = in(reg) val);
         core::arch::asm!("{val} = syscfg", val = out(reg) syscfg_after);
+        core::arch::asm!("isync");
     }
     print_hex(b"guest: syscfg_before=", syscfg_before);
     print_hex(b"guest: syscfg_after=", syscfg_after);
